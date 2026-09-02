@@ -1,0 +1,4406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Shop Time Clock</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Time Clock" />
+<meta name="theme-color" content="#12161c" />
+<style>
+  html, body { margin:0; padding:0; background:#12161c; -webkit-text-size-adjust:100%; }
+  body { overscroll-behavior:none; }
+  #root { min-height:100vh; min-height:100dvh; }
+  #boot {
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:14px; background:#12161c; color:#8b98a8; z-index:999;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  #boot .ring {
+    width:34px; height:34px; border-radius:50%;
+    border:2px solid #2e3743; border-top-color:#f2a310; animation:spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform:rotate(360deg) } }
+  #boot .err { color:#e2593f; max-width:34ch; text-align:center; line-height:1.5; font-size:14px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div id="boot"><div class="ring"></div><div id="bootmsg">Starting the time clock…</div></div>
+
+<script>
+/* ------------------------------------------------------------------
+   Storage. Inside Claude, artifacts get a window.storage API. Out here
+   we provide the same shape backed by IndexedDB, which unlike
+   localStorage has room for months of punch photos.
+------------------------------------------------------------------ */
+(function () {
+  var DB = "shopTimeClock", STORE = "kv", dbp = null;
+
+  function open() {
+    if (dbp) return dbp;
+    dbp = new Promise(function (res, rej) {
+      var r = indexedDB.open(DB, 1);
+      r.onupgradeneeded = function () {
+        var db = r.result;
+        if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+      };
+      r.onsuccess = function () { res(r.result); };
+      r.onerror = function () { rej(r.error); };
+    });
+    return dbp;
+  }
+
+  function tx(mode, fn) {
+    return open().then(function (db) {
+      return new Promise(function (res, rej) {
+        var t = db.transaction(STORE, mode);
+        var store = t.objectStore(STORE);
+        var out = fn(store);
+        t.oncomplete = function () { res(out && out.result !== undefined ? out.result : out); };
+        t.onerror = function () { rej(t.error); };
+        t.onabort = function () { rej(t.error); };
+      });
+    });
+  }
+
+  window.storage = {
+    get: function (key) {
+      return tx("readonly", function (s) { return s.get(key); }).then(function (v) {
+        return v === undefined ? null : { key: key, value: v, shared: false };
+      });
+    },
+    set: function (key, value) {
+      return tx("readwrite", function (s) { s.put(value, key); }).then(function () {
+        return { key: key, value: value, shared: false };
+      });
+    },
+    delete: function (key) {
+      return tx("readwrite", function (s) { s.delete(key); }).then(function () {
+        return { key: key, deleted: true, shared: false };
+      });
+    },
+    list: function (prefix) {
+      return tx("readonly", function (s) { return s.getAllKeys(); }).then(function (keys) {
+        var all = keys || [];
+        var filtered = prefix ? all.filter(function (k) { return String(k).indexOf(prefix) === 0; }) : all;
+        return { keys: filtered, prefix: prefix, shared: false };
+      });
+    }
+  };
+
+  /* Ask Safari not to evict this data. Without it, iOS can clear site
+     storage after a stretch of disuse. Adding to the Home Screen plus
+     this call is what keeps punches around. */
+  if (navigator.storage && navigator.storage.persist) {
+    navigator.storage.persist().catch(function () {});
+  }
+
+  /* Keep the shop iPad awake while the clock is on screen. */
+  var lock = null;
+  function keepAwake() {
+    if (!navigator.wakeLock) return;
+    navigator.wakeLock.request("screen").then(function (l) { lock = l; }).catch(function () {});
+  }
+  keepAwake();
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") keepAwake();
+  });
+})();
+</script>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+
+<script>
+window.addEventListener("error", function (e) {
+  var b = document.getElementById("bootmsg");
+  if (b) {
+    b.className = "err";
+    b.textContent = "Couldn't start: " + (e.message || "unknown error") +
+      ". If this is the first load, check the iPad has internet — the app pulls React from the web the first time.";
+    var r = document.querySelector("#boot .ring");
+    if (r) r.style.display = "none";
+  }
+});
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+
+/* ---------------------------------------------------------------------------
+   Shop Time Clock — iPad kiosk
+   Storage keys:
+     gac:config              -> shop settings
+     gac:employees           -> roster
+     gac:punches:YYYY-MM     -> punch events for that month
+--------------------------------------------------------------------------- */
+
+const CFG_KEY = "gac:config";
+const EMP_KEY = "gac:employees";
+const punchKey = (ym) => `gac:punches:${ym}`;
+const photoKeyFor = (ts, id) => `gac:photo:${ts}:${id}`;
+const signKeyFor = (periodStart, empId) => `gac:signature:${periodStart}:${empId}`;
+const attestKeyFor = (periodStart, empId) => `gac:attest:${periodStart}:${empId}`;
+const schedKeyFor = (weekStart) => `gac:schedule:${weekStart}`;
+
+const DEFAULT_CFG = {
+  shopName: "Genie Auto Center",
+  managerPin: "",
+  weekStart: 1, // 0=Sun ... 6=Sat
+  roundingMin: 0, // 0, 5, 6, 15
+  openHour: 8,
+  closeHour: 18,
+  otRules: "ca", // "ca" = daily >8 / >12, weekly >40 ; "flsa" = weekly >40 only
+  photos: true, // take a photo with each punch
+  photoRequired: false, // block the punch if the camera isn't working
+  photoRetentionDays: 45, // photos older than this are deleted automatically
+  attestation: true, // sign off on hours at the end of the pay period
+  breakRules: true, // California meal and rest period tracking
+  breakReminderMin: 20, // warn this many minutes before the meal deadline
+  mealPay: "discretionary", // "unpaid" | "discretionary" (manager marks it) | "always"
+  minStaff: 2, // never leave fewer than this many people on the floor
+  graceMin: 6, // minutes of slack before a late start or early out gets flagged
+};
+
+/* A lunch is paid when the shop always pays, or when a manager marked
+   that particular one. Either way it stays a real off-duty 30 minutes. */
+const mealIsPaid = (meal, cfg) =>
+  cfg.mealPay === "always" || (cfg.mealPay === "discretionary" && !!meal.paid);
+
+/* ---------- storage ---------- */
+async function sGet(key, fallback) {
+  try {
+    const r = await window.storage.get(key);
+    if (!r || r.value == null) return fallback;
+    return JSON.parse(r.value);
+  } catch {
+    return fallback;
+  }
+}
+async function sSet(key, value) {
+  try {
+    await window.storage.set(key, JSON.stringify(value));
+    return true;
+  } catch (e) {
+    console.error("storage write failed", key, e);
+    return false;
+  }
+}
+
+async function sDel(key) {
+  try {
+    await window.storage.delete(key);
+  } catch {
+    /* already gone */
+  }
+}
+async function sList(prefix) {
+  try {
+    const r = await window.storage.list(prefix);
+    return (r && r.keys) || [];
+  } catch {
+    return [];
+  }
+}
+
+/* Photos live in their own keys so punch records stay small.
+   The key carries the timestamp, which is what lets us expire them. */
+async function purgePhotos(retentionDays) {
+  if (!retentionDays) return 0;
+  const cutoff = Date.now() - retentionDays * 86400000;
+  const keys = await sList("gac:photo:");
+  let n = 0;
+  for (const k of keys) {
+    const ts = Number(String(k).split(":")[2]);
+    if (Number.isFinite(ts) && ts < cutoff) {
+      await sDel(k);
+      n++;
+    }
+  }
+  return n;
+}
+
+/* ---------- time helpers ---------- */
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const pad2 = (n) => String(n).padStart(2, "0");
+const ym = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
+const dayKey = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+
+function fmtTime(d) {
+  if (!d) return "—";
+  let h = d.getHours();
+  const m = pad2(d.getMinutes());
+  const ap = h >= 12 ? "PM" : "AM";
+  h = h % 12 || 12;
+  return `${h}:${m} ${ap}`;
+}
+function fmtTimeInput(d) {
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+function fmtDateLong(d) {
+  return d.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
+}
+function fmtDateShort(d) {
+  return d.toLocaleDateString(undefined, { weekday: "short", month: "numeric", day: "numeric" });
+}
+function hoursText(ms) {
+  if (!ms || ms < 0) ms = 0;
+  const total = Math.round(ms / 60000);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return `${h}h ${pad2(m)}m`;
+}
+function decHours(ms) {
+  if (!ms || ms < 0) return 0;
+  return Math.round((ms / 3600000) * 100) / 100;
+}
+function startOfWeek(d, weekStart) {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const diff = (x.getDay() - weekStart + 7) % 7;
+  x.setDate(x.getDate() - diff);
+  return x;
+}
+function addDays(d, n) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + n);
+  return x;
+}
+function roundTs(ts, mins) {
+  if (!mins) return ts;
+  const step = mins * 60000;
+  return Math.round(ts / step) * step;
+}
+
+/* ---------- shift building ---------- */
+/* California treats the two break types completely differently:
+   a rest period is 10 minutes, paid, on the clock; a meal period is
+   30 minutes, unpaid, off duty. They can never share one bucket. */
+const MEAL_START = ["mealStart", "breakStart"]; // breakStart = pre-split records
+const MEAL_END = ["mealEnd", "breakEnd"];
+
+function buildSessions(events, cfg) {
+  const sorted = [...events].sort((a, b) => a.ts - b.ts);
+  const out = [];
+  let cur = null;
+  const closeMeal = (s, ts) => {
+    if (s && s.openMeal != null) {
+      s.meals.push({ start: s.openMeal, end: ts, paid: !!s.openMealPaid, id: s.openMealId });
+      s.openMeal = null;
+      s.openMealPaid = false;
+      s.openMealId = null;
+    }
+  };
+  const closeRest = (s, ts) => {
+    if (s && s.openRest != null) {
+      s.rests.push({ start: s.openRest, end: ts });
+      s.openRest = null;
+    }
+  };
+  for (const e of sorted) {
+    const ts = roundTs(e.ts, cfg.roundingMin);
+    if (e.type === "in") {
+      if (cur) {
+        closeMeal(cur, ts);
+        closeRest(cur, ts);
+        cur.end = null;
+        cur.missingOut = true;
+        out.push(cur);
+      }
+      cur = {
+        id: e.id,
+        start: ts,
+        end: null,
+        meals: [],
+        rests: [],
+        openMeal: null,
+        openRest: null,
+        openMealPaid: false,
+        openMealId: null,
+        missingOut: false,
+      };
+    } else if (MEAL_START.includes(e.type)) {
+      if (cur && cur.openMeal == null) {
+        closeRest(cur, ts);
+        cur.openMeal = ts;
+        cur.openMealPaid = !!e.paidMeal;
+        cur.openMealId = e.id;
+      }
+    } else if (MEAL_END.includes(e.type)) {
+      closeMeal(cur, ts);
+    } else if (e.type === "restStart") {
+      if (cur && cur.openRest == null && cur.openMeal == null) cur.openRest = ts;
+    } else if (e.type === "restEnd") {
+      closeRest(cur, ts);
+    } else if (e.type === "out") {
+      if (cur) {
+        closeMeal(cur, ts);
+        closeRest(cur, ts);
+        cur.end = ts;
+        out.push(cur);
+        cur = null;
+      }
+    }
+  }
+  if (cur) {
+    cur.open = true;
+    out.push(cur);
+  }
+  return out;
+}
+
+/* Paid time = everything on the clock, minus the lunches the shop isn't
+   paying for. Rest periods are always paid, so they're never subtracted. */
+function sessionWorkedMs(s, cfg, nowMs) {
+  const end = s.end != null ? s.end : s.missingOut ? s.start : nowMs;
+  let ms = end - s.start;
+  for (const m of s.meals) if (!mealIsPaid(m, cfg)) ms -= m.end - m.start;
+  if (s.openMeal != null && !mealIsPaid({ paid: s.openMealPaid }, cfg)) {
+    ms -= (s.end != null ? s.end : nowMs) - s.openMeal;
+  }
+  return Math.max(0, ms);
+}
+/* Lunch minutes the shop gave away, for cost visibility. */
+function sessionPaidMealMs(s, cfg) {
+  return s.meals.reduce((a, m) => a + (mealIsPaid(m, cfg) ? m.end - m.start : 0), 0);
+}
+function sessionMealMs(s, nowMs) {
+  let ms = 0;
+  for (const m of s.meals) ms += m.end - m.start;
+  if (s.openMeal != null) ms += nowMs - s.openMeal;
+  return ms;
+}
+function sessionRestMs(s, nowMs) {
+  let ms = 0;
+  for (const r of s.rests) ms += r.end - r.start;
+  if (s.openRest != null) ms += nowMs - s.openRest;
+  return ms;
+}
+/* kept so older call sites keep working */
+function sessionBreakMs(s, nowMs) {
+  return sessionMealMs(s, nowMs) + sessionRestMs(s, nowMs);
+}
+
+/* ---------- California break rules ---------- */
+const MEAL_MIN_MS = 30 * 60000;
+const REST_MIN_MS = 10 * 60000;
+const HOUR = 3600000;
+
+/* Rest periods: one per four hours "or major fraction thereof."
+   The DLSE reads that as the bands below, not as a rounding formula. */
+function restsEntitled(hours) {
+  if (hours < 3.5) return 0;
+  if (hours <= 6) return 1;
+  if (hours <= 10) return 2;
+  if (hours <= 14) return 3;
+  return 4;
+}
+
+/* Evaluates one worked day against Labor Code 512 and the wage order.
+   Returns what was owed, what happened, and what premium that triggers. */
+function breakCompliance(sessions, cfg, nowMs, attestation, emp) {
+  const workedMs = sessions.reduce((a, s) => a + sessionWorkedMs(s, cfg, nowMs), 0);
+  const hours = workedMs / HOUR;
+  const meals = sessions.flatMap((s) => s.meals).sort((a, b) => a.start - b.start);
+  const rests = sessions.flatMap((s) => s.rests);
+  const shiftStart = sessions.length ? Math.min(...sessions.map((s) => s.start)) : null;
+  const closed = sessions.length > 0 && sessions.every((s) => s.end != null);
+
+  const res = {
+    hours,
+    shiftStart,
+    meals,
+    paidMealMs: sessions.reduce((a, s) => a + sessionPaidMealMs(s, cfg), 0),
+    restsTaken: rests.filter((r) => r.end - r.start >= REST_MIN_MS - 30000).length,
+    restsLogged: rests.length,
+    issues: [],
+    mealPremium: 0,
+    restPremium: 0,
+    meal1: null,
+    meal2: null,
+    restsOwed: restsEntitled(hours),
+  };
+  if (!sessions.length || shiftStart == null) return res;
+
+  const waived1 = attestation?.meal1 === "waived";
+  const waived2 = attestation?.meal2 === "waived";
+  const denied = (k) => attestation?.[k] === "denied";
+
+  /* ---- first meal: must begin before the end of the 5th hour ---- */
+  if (hours > 5) {
+    const deadline = shiftStart + 5 * HOUR;
+    const m = meals[0] || null;
+    const dur = m ? m.end - m.start : 0;
+    const canWaive = hours <= 6;
+    const info = {
+      required: true,
+      deadline,
+      taken: !!m,
+      start: m ? m.start : null,
+      minutes: m ? Math.round(dur / 60000) : 0,
+      late: m ? m.start > deadline : false,
+      short: m ? dur < MEAL_MIN_MS - 30000 : false,
+      canWaive,
+      waived: waived1 && canWaive,
+    };
+    info.ok = info.waived || (info.taken && !info.late && !info.short);
+    res.meal1 = info;
+
+    if (!info.ok && closed) {
+      if (!info.taken) res.issues.push(canWaive ? "No lunch taken" : "Lunch missed");
+      else if (info.short) res.issues.push(`Lunch was only ${info.minutes} min`);
+      else if (info.late) res.issues.push(`Lunch started after the 5th hour`);
+      if (!waived1) res.mealPremium = 1;
+    }
+  }
+
+  /* ---- second meal: before the end of the 10th hour ---- */
+  if (hours > 10) {
+    /* A paid lunch is time worked, so it doesn't push the deadline out.
+       An unpaid one does, because those minutes aren't hours worked. */
+    const first = meals[0];
+    const firstDur = first ? first.end - first.start : 0;
+    const deadline =
+      shiftStart + 10 * HOUR + (first && mealIsPaid(first, cfg) ? 0 : firstDur);
+    const m = meals[1] || null;
+    const dur = m ? m.end - m.start : 0;
+    const canWaive = hours <= 12 && !waived1;
+    const info = {
+      required: true,
+      deadline,
+      taken: !!m,
+      start: m ? m.start : null,
+      minutes: m ? Math.round(dur / 60000) : 0,
+      late: m ? m.start > deadline : false,
+      short: m ? dur < MEAL_MIN_MS - 30000 : false,
+      canWaive,
+      waived: waived2 && canWaive,
+    };
+    info.ok = info.waived || (info.taken && !info.late && !info.short);
+    res.meal2 = info;
+    if (!info.ok && closed && !waived2) {
+      res.issues.push("Second lunch missed on a shift over 10 hours");
+      res.mealPremium = 1; // statute caps meal premiums at one per day
+    }
+  }
+
+  /* ---- rest periods ---- */
+  if (res.restsOwed > res.restsTaken && closed) {
+    res.issues.push(
+      `${res.restsOwed - res.restsTaken} rest break${
+        res.restsOwed - res.restsTaken > 1 ? "s" : ""
+      } not logged`
+    );
+    if (attestation?.rest !== "taken") res.restPremium = 1;
+  }
+
+  /* An employee saying they were prevented is the thing that decides
+     whether a premium is owed — a waiver only counts if it was free. */
+  if (denied("meal1") || denied("meal2")) res.mealPremium = 1;
+  if (denied("rest")) res.restPremium = 1;
+
+  return res;
+}
+
+/* What the person on the clock owes next, for live prompts. */
+function nextBreakDue(session, cfg, nowMs) {
+  if (!session || session.end != null) return null;
+  const workedMs = sessionWorkedMs(session, cfg, nowMs);
+  const meals = session.meals;
+  if (session.openMeal != null) {
+    const elapsed = nowMs - session.openMeal;
+    return {
+      kind: "onMeal",
+      dueAt: session.openMeal + MEAL_MIN_MS,
+      remaining: MEAL_MIN_MS - elapsed,
+      label: "On lunch",
+    };
+  }
+  if (session.openRest != null) {
+    const elapsed = nowMs - session.openRest;
+    return {
+      kind: "onRest",
+      dueAt: session.openRest + REST_MIN_MS,
+      remaining: REST_MIN_MS - elapsed,
+      label: "On rest break",
+    };
+  }
+  const goodMeals = meals.filter((m) => m.end - m.start >= MEAL_MIN_MS - 30000);
+  if (goodMeals.length === 0) {
+    const deadline = session.start + 5 * HOUR;
+    if (workedMs > 3.5 * HOUR || nowMs > deadline - 90 * 60000) {
+      return {
+        kind: "meal1",
+        dueAt: deadline,
+        remaining: deadline - nowMs,
+        label: "Lunch due",
+      };
+    }
+  } else if (workedMs > 10 * HOUR && goodMeals.length < 2) {
+    const firstDur = meals[0].end - meals[0].start;
+    const deadline = session.start + 10 * HOUR + firstDur;
+    return {
+      kind: "meal2",
+      dueAt: deadline,
+      remaining: deadline - nowMs,
+      label: "Second lunch due",
+    };
+  }
+  return null;
+}
+
+/* ---------- overtime ---------- */
+function splitDay(hrs, rules) {
+  if (rules !== "ca") return { reg: hrs, ot: 0, dt: 0 };
+  const reg = Math.min(hrs, 8);
+  const ot = Math.max(0, Math.min(hrs, 12) - 8);
+  const dt = Math.max(0, hrs - 12);
+  return { reg, ot, dt };
+}
+function weekTotals(dayHourList, rules) {
+  let reg = 0,
+    ot = 0,
+    dt = 0;
+  for (const h of dayHourList) {
+    const s = splitDay(h, rules);
+    reg += s.reg;
+    ot += s.ot;
+    dt += s.dt;
+  }
+  if (reg > 40) {
+    ot += reg - 40;
+    reg = 40;
+  }
+  const r = (n) => Math.round(n * 100) / 100;
+  return { reg: r(reg), ot: r(ot), dt: r(dt), total: r(reg + ot + dt) };
+}
+
+/* ---------- schedule helpers ---------- */
+const hhmmToMin = (s) => {
+  const [h, m] = String(s || "").split(":").map(Number);
+  return Number.isFinite(h) && Number.isFinite(m) ? h * 60 + m : null;
+};
+function fmtHHMM(s) {
+  const mins = hhmmToMin(s);
+  if (mins == null) return "—";
+  let h = Math.floor(mins / 60) % 24;
+  const m = mins % 60;
+  const ap = h >= 12 ? "p" : "a";
+  h = h % 12 || 12;
+  return m === 0 ? `${h}${ap}` : `${h}:${pad2(m)}${ap}`;
+}
+/* Minutes a scheduled shift actually pays for. An overnight shift wraps. */
+function shiftMinutes(shift, cfg) {
+  if (!shift || !shift.start || !shift.end) return 0;
+  const a = hhmmToMin(shift.start);
+  let b = hhmmToMin(shift.end);
+  if (a == null || b == null) return 0;
+  if (b <= a) b += 24 * 60;
+  const lunch = cfg?.mealPay === "always" ? 0 : Number(shift.lunch) || 0;
+  return Math.max(0, b - a - lunch);
+}
+const shiftHours = (shift, cfg) => Math.round((shiftMinutes(shift, cfg) / 60) * 100) / 100;
+
+const SHIFT_PRESETS = [
+  { label: "Open", start: "08:00", end: "16:00", lunch: 30 },
+  { label: "Mid", start: "09:00", end: "17:00", lunch: 30 },
+  { label: "Close", start: "10:00", end: "18:00", lunch: 30 },
+  { label: "Half day", start: "08:00", end: "12:00", lunch: 0 },
+];
+
+/* Anchor a scheduled "HH:MM" to a real calendar day so it can be compared
+   against punch timestamps. Wraps past midnight for overnight shifts. */
+function schedTs(date, hhmm, wrapPastStart) {
+  const mins = hhmmToMin(hhmm);
+  if (mins == null) return null;
+  const base = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
+  let ts = base.getTime() + mins * 60000;
+  if (wrapPastStart != null && ts <= wrapPastStart) ts += 24 * 3600000;
+  return ts;
+}
+
+/* ---------- pay period ---------- */
+function periodEnd(cfg, periodStartDate) {
+  return addDays(periodStartDate, 6);
+}
+function isLastDayOfPeriod(cfg, d) {
+  return dayKey(d) === dayKey(periodEnd(cfg, startOfWeek(d, cfg.weekStart)));
+}
+
+/* One place that turns raw punches into the numbers a person signs for.
+   The review screen and the manager timecard both call this, so what the
+   employee agrees to is exactly what shows up on the payroll export. */
+function periodSummary(events, cfg, periodStartDate, nowMs) {
+  const wStart = periodStartDate.getTime();
+  const wEnd = addDays(periodStartDate, 7).getTime();
+  const sessions = buildSessions(
+    [...events].sort((a, b) => a.ts - b.ts),
+    cfg
+  ).filter((s) => s.start >= wStart && s.start < wEnd);
+
+  const days = Array.from({ length: 7 }, (_, i) => addDays(periodStartDate, i));
+  const rows = days.map((d) => {
+    const k = dayKey(d);
+    const mine = sessions.filter((s) => dayKey(new Date(s.start)) === k);
+    const ms = mine.reduce((a, s) => a + sessionWorkedMs(s, cfg, nowMs), 0);
+    const breakMs = mine.reduce((a, s) => a + sessionBreakMs(s, nowMs), 0);
+    const mealMs = mine.reduce((a, s) => a + sessionMealMs(s, nowMs), 0);
+    const paidMealMs = mine.reduce((a, s) => a + sessionPaidMealMs(s, cfg), 0);
+    const restCount = mine.reduce((a, s) => a + s.rests.length, 0);
+    return {
+      date: d,
+      ms,
+      breakMs,
+      mealMs,
+      paidMealMs,
+      restCount,
+      sessions: mine,
+      hours: decHours(ms),
+    };
+  });
+  const totals = weekTotals(rows.map((r) => r.hours), cfg.otRules);
+  const openShift = sessions.some((s) => s.open || s.missingOut);
+  return { days, rows, totals, sessions, openShift };
+}
+
+/* ---------- camera ---------- */
+const CAM_MSG = {
+  idle: "",
+  starting: "Camera starting…",
+  live: "Camera on — a photo is saved with your punch",
+  denied: "Camera blocked. Allow camera access in Safari settings.",
+  unsupported: "No camera available on this device.",
+};
+
+function useCamera(enabled) {
+  const [stream, setStream] = useState(null);
+  const [state, setState] = useState("idle");
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+
+  const start = useCallback(async () => {
+    if (!enabled) return;
+    if (streamRef.current) {
+      setState("live");
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setState("unsupported");
+      return;
+    }
+    setState("starting");
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+        audio: false,
+      });
+      streamRef.current = s;
+      setStream(s);
+      setState("live");
+    } catch (err) {
+      setState(err && err.name === "NotAllowedError" ? "denied" : "unsupported");
+    }
+  }, [enabled]);
+
+  const stop = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      setStream(null);
+    }
+    setState("idle");
+  }, []);
+
+  /* Downscale hard: a 320px JPEG is plenty to recognise a face
+     and keeps a year of punches inside the storage budget. */
+  const capture = useCallback(() => {
+    const v = videoRef.current;
+    if (!v || !v.videoWidth) return null;
+    try {
+      const w = 320;
+      const h = Math.round((v.videoHeight / v.videoWidth) * w);
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext("2d");
+      ctx.translate(w, 0);
+      ctx.scale(-1, 1); // un-mirror so the saved photo reads naturally
+      ctx.drawImage(v, 0, 0, w, h);
+      return c.toDataURL("image/jpeg", 0.55);
+    } catch {
+      return null;
+    }
+  }, []);
+
+  useEffect(() => () => stop(), [stop]);
+
+  return { stream, state, start, stop, capture, videoRef };
+}
+
+function CameraFeed({ cam, size = "sm" }) {
+  const { stream, state, videoRef } = cam;
+  useEffect(() => {
+    if (videoRef.current && stream) {
+      videoRef.current.srcObject = stream;
+      const p = videoRef.current.play();
+      if (p && p.catch) p.catch(() => {});
+    }
+  }, [stream, videoRef]);
+
+  return (
+    <div className={`cam ${size} ${state}`}>
+      <video ref={videoRef} playsInline muted autoPlay className="camVid" />
+      {state !== "live" && (
+        <div className="camFallback">
+          <span className="camIcon">◉</span>
+          <span>{CAM_MSG[state] || "Camera off"}</span>
+        </div>
+      )}
+      {state === "live" && <span className="camDot" />}
+    </div>
+  );
+}
+
+/* ---------- signature ---------- */
+function SignaturePad({ onChange }) {
+  const canvasRef = useRef(null);
+  const drawing = useRef(false);
+  const hasInk = useRef(false);
+  const last = useRef(null);
+
+  useEffect(() => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const rect = c.getBoundingClientRect();
+    c.width = rect.width * dpr;
+    c.height = rect.height * dpr;
+    const ctx = c.getContext("2d");
+    ctx.scale(dpr, dpr);
+    ctx.lineWidth = 2.4;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = "#e9eef4";
+  }, []);
+
+  const pos = (e) => {
+    const r = canvasRef.current.getBoundingClientRect();
+    const p = e.touches ? e.touches[0] : e;
+    return { x: p.clientX - r.left, y: p.clientY - r.top };
+  };
+  const down = (e) => {
+    e.preventDefault();
+    drawing.current = true;
+    last.current = pos(e);
+  };
+  const move = (e) => {
+    if (!drawing.current) return;
+    e.preventDefault();
+    const ctx = canvasRef.current.getContext("2d");
+    const p = pos(e);
+    ctx.beginPath();
+    ctx.moveTo(last.current.x, last.current.y);
+    ctx.lineTo(p.x, p.y);
+    ctx.stroke();
+    last.current = p;
+    if (!hasInk.current) {
+      hasInk.current = true;
+      onChange(true);
+    }
+  };
+  const up = () => {
+    drawing.current = false;
+  };
+
+  const clear = () => {
+    const c = canvasRef.current;
+    const ctx = c.getContext("2d");
+    ctx.clearRect(0, 0, c.width, c.height);
+    hasInk.current = false;
+    onChange(false);
+  };
+
+  /* Flatten to a small PNG — line art compresses to a few KB. */
+  const exportPng = () => {
+    const c = canvasRef.current;
+    if (!c || !hasInk.current) return null;
+    const out = document.createElement("canvas");
+    out.width = 480;
+    out.height = Math.round((c.height / c.width) * 480);
+    const ctx = out.getContext("2d");
+    ctx.fillStyle = "#1a2029";
+    ctx.fillRect(0, 0, out.width, out.height);
+    ctx.drawImage(c, 0, 0, out.width, out.height);
+    return out.toDataURL("image/png");
+  };
+
+  useEffect(() => {
+    if (canvasRef.current) canvasRef.current.__export = exportPng;
+  });
+
+  return (
+    <div className="sigWrap">
+      <canvas
+        ref={canvasRef}
+        className="sigPad"
+        onPointerDown={down}
+        onPointerMove={move}
+        onPointerUp={up}
+        onPointerLeave={up}
+        onTouchStart={down}
+        onTouchMove={move}
+        onTouchEnd={up}
+      />
+      <div className="sigBase">
+        <span className="sigX">✕ ————————————————</span>
+        <button className="btn tiny" onClick={clear}>
+          Clear
+        </button>
+      </div>
+      <input type="hidden" ref={(el) => el && (el.__pad = canvasRef.current)} />
+    </div>
+  );
+}
+
+/* ---------- end-of-period review ---------- */
+function ReviewSheet({ emp, cfg, summary, periodStartDate, onSubmit, onDefer }) {
+  const [mode, setMode] = useState("review"); // review | sign | dispute
+  const [inked, setInked] = useState(false);
+  const [note, setNote] = useState("");
+  const padHost = useRef(null);
+  const pEnd = periodEnd(cfg, periodStartDate);
+
+  const sign = () => {
+    const canvas = padHost.current && padHost.current.querySelector("canvas");
+    const png = canvas && canvas.__export ? canvas.__export() : null;
+    if (!png) return;
+    onSubmit({ agreed: true, signature: png, note: "" });
+  };
+
+  return (
+    <div className="overlay">
+      <div className="reviewCard">
+        <header className="reviewHead">
+          <div>
+            <h2 className="reviewTitle">Check your hours, {emp.name.split(" ")[0]}</h2>
+            <p className="reviewSub">
+              Pay period {periodStartDate.toLocaleDateString(undefined, { month: "short", day: "numeric" })} –{" "}
+              {pEnd.toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+            </p>
+          </div>
+          <div className="reviewTotal">
+            <strong>{summary.totals.total.toFixed(2)}</strong>
+            <span>hours</span>
+          </div>
+        </header>
+
+        {mode === "review" && (
+          <>
+            <ul className="reviewDays">
+              {summary.rows.map((r) => (
+                <li key={dayKey(r.date)} className={r.hours === 0 ? "off" : ""}>
+                  <span className="rdDay">{fmtDateShort(r.date)}</span>
+                  <span className="rdPunch">
+                    {r.sessions.length === 0
+                      ? "Off"
+                      : r.sessions
+                          .map(
+                            (s) =>
+                              `${fmtTime(new Date(s.start))} – ${
+                                s.end ? fmtTime(new Date(s.end)) : "no clock-out"
+                              }`
+                          )
+                          .join(", ")}
+                  </span>
+                  <span className="rdBreak">
+                    {r.mealMs > 0
+                      ? `${Math.round(r.mealMs / 60000)}m lunch${
+                          r.paidMealMs > 0 ? " (shop paid)" : ""
+                        }`
+                      : r.hours > 5
+                      ? "no lunch"
+                      : ""}
+                    {r.restCount > 0 ? ` · ${r.restCount} rest` : ""}
+                  </span>
+                  <span className="rdHrs">{r.hours > 0 ? r.hours.toFixed(2) : "—"}</span>
+                </li>
+              ))}
+            </ul>
+
+            <div className="reviewSplit">
+              <span>
+                Regular <strong>{summary.totals.reg.toFixed(2)}</strong>
+              </span>
+              <span>
+                Overtime <strong>{summary.totals.ot.toFixed(2)}</strong>
+              </span>
+              <span>
+                Double time <strong>{summary.totals.dt.toFixed(2)}</strong>
+              </span>
+            </div>
+
+            {summary.openShift && (
+              <p className="reviewWarn">
+                One shift has no clock-out, so these hours are incomplete. Tell your manager before
+                you sign.
+              </p>
+            )}
+
+            <div className="reviewActs">
+              <button className="bigAct in" onClick={() => setMode("sign")}>
+                These hours are right
+              </button>
+              <button className="bigAct brk" onClick={() => setMode("dispute")}>
+                Something's wrong
+              </button>
+            </div>
+            <button className="linkBtn wide" onClick={onDefer}>
+              Not now — remind me next punch
+            </button>
+          </>
+        )}
+
+        {mode === "sign" && (
+          <>
+            <p className="signLead">
+              Sign below to confirm you worked {summary.totals.total.toFixed(2)} hours this pay
+              period, including{" "}
+              {summary.totals.ot + summary.totals.dt > 0
+                ? `${(summary.totals.ot + summary.totals.dt).toFixed(2)} overtime hours`
+                : "no overtime"}
+              , and that you were able to take your meal and rest breaks.
+            </p>
+            <div ref={padHost}>
+              <SignaturePad onChange={setInked} />
+            </div>
+            <div className="reviewActs">
+              <button className="bigAct in" disabled={!inked} onClick={sign}>
+                Sign and finish
+              </button>
+              <button className="bigAct brk" onClick={() => setMode("review")}>
+                Back to my hours
+              </button>
+            </div>
+            <p className="signFine">
+              Signing doesn't give up any pay you're owed. If you find a mistake later, tell your
+              manager and it gets fixed.
+            </p>
+          </>
+        )}
+
+        {mode === "dispute" && (
+          <>
+            <p className="signLead">
+              Tell us what's off and your manager will review it before payroll runs. Nothing you say
+              here affects your pay for hours you actually worked.
+            </p>
+            <label className="fld">
+              <span>What's wrong?</span>
+              <textarea
+                className="disputeBox"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="Example: Thursday I clocked out at 6:15, not 5:30. Or: I missed my lunch on Tuesday."
+              />
+            </label>
+            <div className="reviewActs">
+              <button
+                className="bigAct out"
+                disabled={!note.trim()}
+                onClick={() => onSubmit({ agreed: false, signature: null, note: note.trim() })}
+              >
+                Send to manager
+              </button>
+              <button className="bigAct brk" onClick={() => setMode("review")}>
+                Back to my hours
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- one person's schedule ---------- */
+/* Reached only after a correct PIN, and it never loads anyone else's
+   shifts into view — the roster is filtered down to this employee before
+   anything renders. */
+function MySchedule({ emp, cfg, onClose }) {
+  const [offset, setOffset] = useState(0);
+  const [sched, setSched] = useState(undefined);
+  const weekStart = addDays(startOfWeek(new Date(), cfg.weekStart), offset * 7);
+  const todayKey = dayKey(new Date());
+
+  useEffect(() => {
+    let dead = false;
+    setSched(undefined);
+    (async () => {
+      const s = await sGet(schedKeyFor(dayKey(weekStart)), null);
+      if (!dead) setSched(s);
+    })();
+    return () => {
+      dead = true;
+    };
+  }, [offset]); // eslint-disable-line
+
+  const mine = sched?.published ? sched.shifts?.[emp.id] || {} : null;
+  const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+  const total = mine
+    ? days.reduce((a, d) => a + shiftHours(mine[dayKey(d)], cfg), 0)
+    : 0;
+
+  return (
+    <div className="overlay">
+      <div className="reviewCard">
+        <button className="closeX" onClick={onClose} aria-label="Close">
+          ✕
+        </button>
+        <header className="reviewHead">
+          <div>
+            <h2 className="reviewTitle">Your schedule</h2>
+            <p className="reviewSub">
+              {emp.name} ·{" "}
+              {weekStart.toLocaleDateString(undefined, { month: "short", day: "numeric" })} –{" "}
+              {addDays(weekStart, 6).toLocaleDateString(undefined, {
+                month: "short",
+                day: "numeric",
+              })}
+            </p>
+          </div>
+          {mine && (
+            <div className="reviewTotal">
+              <strong>{total.toFixed(1)}</strong>
+              <span>hours</span>
+            </div>
+          )}
+        </header>
+
+        <div className="weekNav tight">
+          <button
+            className="btn ghost"
+            onClick={() => setOffset((o) => o - 1)}
+            disabled={offset <= -1}
+          >
+            ‹ Last week
+          </button>
+          <span className="weekTag">
+            {offset === 0 ? "This week" : offset === 1 ? "Next week" : `${offset} weeks out`}
+          </span>
+          <button
+            className="btn ghost"
+            onClick={() => setOffset((o) => o + 1)}
+            disabled={offset >= 3}
+          >
+            Next week ›
+          </button>
+        </div>
+
+        {sched === undefined ? (
+          <p className="muted pad">Loading…</p>
+        ) : !mine ? (
+          <div className="schedEmpty">
+            <p>This week isn't posted yet.</p>
+            <span>Your manager will put it up when it's ready.</span>
+          </div>
+        ) : (
+          <ul className="myDays">
+            {days.map((d) => {
+              const k = dayKey(d);
+              const sh = mine[k];
+              const isToday = k === todayKey;
+              return (
+                <li key={k} className={`${isToday ? "today" : ""} ${sh ? "" : "off"}`}>
+                  <span className="myDayName">
+                    {d.toLocaleDateString(undefined, { weekday: "long" })}
+                    <em>{d.toLocaleDateString(undefined, { month: "short", day: "numeric" })}</em>
+                  </span>
+                  {sh ? (
+                    <>
+                      <span className="myTimes">
+                        {fmtHHMM(sh.start)} – {fmtHHMM(sh.end)}
+                      </span>
+                      <span className="myMeta">
+                        {shiftHours(sh, cfg).toFixed(1)} hrs
+                        {sh.lunch ? ` · ${sh.lunch}m lunch` : ""}
+                      </span>
+                      {sh.note && <span className="myNote">{sh.note}</span>}
+                    </>
+                  ) : (
+                    <span className="myTimes offTxt">Off</span>
+                  )}
+                  {isToday && <span className="todayTag">Today</span>}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        <button className="linkBtn wide" onClick={onClose}>
+          Done
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- daily break attestation ---------- */
+/* Brinker v. Superior Court says the employer must provide breaks, not
+   police them. So this asks what happened rather than blocking anyone:
+   a free choice to skip is a waiver, being prevented is a premium hour. */
+function BreakAttest({ emp, comp, onSubmit, onSkip }) {
+  const [meal, setMeal] = useState(null);
+  const [rest, setRest] = useState(null);
+  const [note, setNote] = useState("");
+
+  const needMeal = comp.meal1 && !comp.meal1.ok;
+  const needRest = comp.restsOwed > comp.restsTaken;
+  const canWaive = comp.meal1?.canWaive;
+  const ready = (!needMeal || meal) && (!needRest || rest);
+
+  const mealQ = !comp.meal1?.taken
+    ? "You didn't take a lunch today."
+    : comp.meal1.short
+    ? `Your lunch was ${comp.meal1.minutes} minutes instead of 30.`
+    : "Your lunch started after the end of your fifth hour.";
+
+  return (
+    <div className="overlay">
+      <div className="reviewCard">
+        <h2 className="reviewTitle">Before you go, {emp.name.split(" ")[0]}</h2>
+        <p className="reviewSub">
+          Answer honestly. There's no wrong answer and nothing here counts against you.
+        </p>
+
+        {needMeal && (
+          <div className="attestBlock">
+            <p className="attestQ">{mealQ}</p>
+            <div className="attestOpts">
+              <button
+                className={`attestOpt ${meal === "waived" ? "on" : ""}`}
+                onClick={() => setMeal("waived")}
+              >
+                <strong>I chose to skip or cut it short</strong>
+                <span>
+                  Nobody stopped me. I was free to take it{canWaive ? " and I gave it up" : ""}.
+                </span>
+              </button>
+              <button
+                className={`attestOpt ${meal === "denied" ? "on" : ""}`}
+                onClick={() => setMeal("denied")}
+              >
+                <strong>I couldn't take it</strong>
+                <span>Too busy, told not to, or no coverage. The shop owes me for this.</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {needRest && (
+          <div className="attestBlock">
+            <p className="attestQ">
+              You logged {comp.restsTaken} of {comp.restsOwed} paid rest breaks.
+            </p>
+            <div className="attestOpts">
+              <button
+                className={`attestOpt ${rest === "taken" ? "on" : ""}`}
+                onClick={() => setRest("taken")}
+              >
+                <strong>I took them, just didn't clock them</strong>
+                <span>I had my breaks — I forgot to hit the button.</span>
+              </button>
+              <button
+                className={`attestOpt ${rest === "waived" ? "on" : ""}`}
+                onClick={() => setRest("waived")}
+              >
+                <strong>I chose not to take them</strong>
+                <span>They were available and I skipped them.</span>
+              </button>
+              <button
+                className={`attestOpt ${rest === "denied" ? "on" : ""}`}
+                onClick={() => setRest("denied")}
+              >
+                <strong>I couldn't take them</strong>
+                <span>Too busy or told not to. The shop owes me for this.</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {(meal === "denied" || rest === "denied") && (
+          <label className="fld">
+            <span>Anything you want your manager to know? (optional)</span>
+            <textarea
+              className="disputeBox short"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder="Example: three cars stacked up and nobody could cover my bay."
+            />
+          </label>
+        )}
+
+        <div className="reviewActs">
+          <button
+            className="bigAct in"
+            disabled={!ready}
+            onClick={() => onSubmit({ meal1: meal, rest, note: note.trim() })}
+          >
+            Submit and clock out
+          </button>
+        </div>
+        <p className="signFine">
+          If you say you were prevented from taking a break, California requires an extra hour of pay
+          at your regular rate. That gets flagged for payroll automatically.
+        </p>
+        <button className="linkBtn wide" onClick={onSkip}>
+          Skip for now
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- shared UI ---------- */
+function Keypad({ title, subtitle, onSubmit, onCancel, error, length = 4, cam }) {
+  const [val, setVal] = useState("");
+  useEffect(() => {
+    if (val.length === length) {
+      const v = val;
+      setVal("");
+      onSubmit(v);
+    }
+  }, [val, length, onSubmit]);
+  const press = (k) => {
+    if (k === "del") setVal((v) => v.slice(0, -1));
+    else if (val.length < length) setVal((v) => v + k);
+  };
+  return (
+    <div className="overlay">
+      <div className="pinCard">
+        <button className="closeX" onClick={onCancel} aria-label="Cancel">
+          ✕
+        </button>
+        {cam && <CameraFeed cam={cam} size="sm" />}
+        <h2 className="pinName">{title}</h2>
+        <p className="pinSub">{subtitle}</p>
+        <div className={`dots ${error ? "shake" : ""}`}>
+          {Array.from({ length }).map((_, i) => (
+            <span key={i} className={`dot ${i < val.length ? "on" : ""}`} />
+          ))}
+        </div>
+        {error ? <p className="pinErr">{error}</p> : <p className="pinErrHold" />}
+        <div className="keys">
+          {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((k) => (
+            <button key={k} className="key" onClick={() => press(k)}>
+              {k}
+            </button>
+          ))}
+          <span />
+          <button className="key" onClick={() => press("0")}>
+            0
+          </button>
+          <button className="key keyDel" onClick={() => press("del")}>
+            ⌫
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Toast({ text, tone }) {
+  if (!text) return null;
+  return <div className={`toast ${tone || ""}`}>{text}</div>;
+}
+
+/* ---------- main ---------- */
+function TimeClock() {
+  const [ready, setReady] = useState(false);
+  const [cfg, setCfg] = useState(DEFAULT_CFG);
+  const [employees, setEmployees] = useState([]);
+  const [months, setMonths] = useState({}); // { 'YYYY-MM': [events] }
+  const monthsRef = useRef({}); // same data, readable immediately after a write
+  const [now, setNow] = useState(Date.now());
+  const [screen, setScreen] = useState("kiosk"); // setup | kiosk | manager
+  const [pinFor, setPinFor] = useState(null); // employee object
+  const [managerPin, setManagerPin] = useState(false);
+  const [pinErr, setPinErr] = useState("");
+  const [actionFor, setActionFor] = useState(null);
+  const [review, setReview] = useState(null);
+  const [breakAsk, setBreakAsk] = useState(null);
+  const [showSchedule, setShowSchedule] = useState(null);
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+
+  /* load */
+  useEffect(() => {
+    (async () => {
+      const c = await sGet(CFG_KEY, null);
+      const e = await sGet(EMP_KEY, []);
+      const thisM = ym(new Date());
+      const prevM = ym(addDays(new Date(), -35));
+      const m = {};
+      m[thisM] = await sGet(punchKey(thisM), []);
+      if (prevM !== thisM) m[prevM] = await sGet(punchKey(prevM), []);
+      const merged = c ? { ...DEFAULT_CFG, ...c } : DEFAULT_CFG;
+      /* older saves used a paidMeal boolean */
+      if (c && c.mealPay == null) merged.mealPay = c.mealPaid ? "always" : "discretionary";
+      delete merged.mealPaid;
+      delete merged.mealOnDuty;
+      setCfg(merged);
+      setEmployees(e || []);
+      monthsRef.current = m;
+      setMonths(m);
+      setScreen(c && c.managerPin ? "kiosk" : "setup");
+      setReady(true);
+      purgePhotos(merged.photoRetentionDays);
+    })();
+  }, []);
+
+  /* tick */
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const cam = useCamera(cfg.photos);
+
+  const flash = useCallback((text, tone) => {
+    setToast({ text, tone });
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 3000);
+  }, []);
+
+  const loadMonth = useCallback(
+    async (key) => {
+      if (months[key]) return months[key];
+      const data = await sGet(punchKey(key), []);
+      monthsRef.current = { ...monthsRef.current, [key]: data };
+      setMonths(monthsRef.current);
+      return data;
+    },
+    [months]
+  );
+
+  const allEvents = useCallback(() => {
+    return Object.values(months).flat();
+  }, [months]);
+
+  const eventsFor = useCallback(
+    (empId) => allEvents().filter((e) => e.empId === empId),
+    [allEvents]
+  );
+
+  const addEvent = useCallback(
+    async (empId, type, ts, photo, payload) => {
+      const at = ts || Date.now();
+      const key = ym(new Date(at));
+      const existing = months[key] || (await sGet(punchKey(key), []));
+      const ev = { id: uid(), empId, type, ts: at };
+      if (payload) ev.payload = payload;
+      if (photo) {
+        const pk = photoKeyFor(at, ev.id);
+        const ok = await sSet(pk, photo);
+        if (ok) ev.photoKey = pk;
+      }
+      const next = [...existing, ev];
+      monthsRef.current = { ...monthsRef.current, [key]: next };
+      setMonths(monthsRef.current);
+      await sSet(punchKey(key), next);
+      return ev;
+    },
+    [months]
+  );
+
+  const updateEvents = useCallback(async (key, list) => {
+    monthsRef.current = { ...monthsRef.current, [key]: list };
+    setMonths(monthsRef.current);
+    await sSet(punchKey(key), list);
+  }, []);
+
+  const saveCfg = useCallback(async (next) => {
+    setCfg(next);
+    await sSet(CFG_KEY, next);
+  }, []);
+  const saveEmployees = useCallback(async (next) => {
+    setEmployees(next);
+    await sSet(EMP_KEY, next);
+  }, []);
+
+  /* status */
+  const sessionsToday = useCallback(
+    (empId) => {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const evs = eventsFor(empId).filter((e) => e.ts >= start.getTime());
+      return buildSessions(evs, cfg);
+    },
+    [eventsFor, cfg]
+  );
+
+  const statusOf = useCallback(
+    (empId) => {
+      const evs = eventsFor(empId).sort((a, b) => a.ts - b.ts);
+      const last = evs[evs.length - 1];
+      if (!last || last.type === "out") return { state: "out", since: null };
+      if (MEAL_START.includes(last.type)) return { state: "meal", since: last.ts };
+      if (last.type === "restStart") return { state: "rest", since: last.ts };
+      const sessions = buildSessions(evs, cfg);
+      const open = sessions.find((s) => s.open);
+      return { state: "in", since: open ? open.start : last.ts };
+    },
+    [eventsFor, cfg]
+  );
+
+  const dueFor = useCallback(
+    (empId) => {
+      const open = sessionsToday(empId).find((s) => s.open);
+      return open ? nextBreakDue(open, cfg, now) : null;
+    },
+    [sessionsToday, cfg, now]
+  );
+
+  const todayMs = useCallback(
+    (empId) => {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const evs = eventsFor(empId).filter((e) => e.ts >= start.getTime());
+      const sessions = buildSessions(evs, cfg);
+      return sessions.reduce((a, s) => a + sessionWorkedMs(s, cfg, now), 0);
+    },
+    [eventsFor, cfg, now]
+  );
+
+  /* punch flow */
+  const handleEmployeeTap = (emp) => {
+    setPinErr("");
+    setPinFor(emp);
+    cam.start(); // warm the camera up while they type their PIN
+  };
+  const closePunchFlow = () => {
+    setPinFor(null);
+    setActionFor(null);
+    setShowSchedule(null);
+    setPinErr("");
+    cam.stop();
+  };
+  const submitEmployeePin = (v) => {
+    if (!pinFor) return;
+    if (v !== pinFor.pin) {
+      setPinErr("That PIN doesn't match. Try again.");
+      return;
+    }
+    setPinErr("");
+    setActionFor(pinFor);
+    setPinFor(null);
+  };
+  const doPunch = async (type) => {
+    const emp = actionFor;
+    const shot = cfg.photos ? cam.capture() : null;
+    if (cfg.photos && cfg.photoRequired && !shot) {
+      flash("Camera isn't working — get a manager to punch you in", "out");
+      return;
+    }
+    setActionFor(null);
+    cam.stop();
+    const ev = await addEvent(emp.id, type, null, shot);
+    const t = fmtTime(new Date(ev.ts));
+    const label = {
+      in: `${emp.name} clocked in at ${t}`,
+      out: `${emp.name} clocked out at ${t}`,
+      mealStart: `${emp.name} started lunch at ${t}`,
+      mealEnd: `${emp.name} back from lunch at ${t}`,
+      restStart: `${emp.name} on rest break at ${t}`,
+      restEnd: `${emp.name} back from rest break at ${t}`,
+    }[type];
+    flash(label, type === "out" ? "out" : "in");
+
+    if (type === "out") {
+      const shown = await checkBreaks(emp, ev);
+      if (shown) return; // period review runs after the break questions
+    }
+    if (cfg.attestation) await maybeReview(emp, type, ev);
+  };
+
+  /* Ask about breaks only when the day actually fell short. */
+  const checkBreaks = useCallback(
+    async (emp, ev) => {
+      if (!cfg.breakRules) return false;
+      const dStart = new Date(ev.ts);
+      dStart.setHours(0, 0, 0, 0);
+      const evs = Object.values(monthsRef.current)
+        .flat()
+        .filter((x) => x.empId === emp.id && x.ts >= dStart.getTime());
+      const sessions = buildSessions(evs, cfg);
+      if (!sessions.length) return false;
+      const comp = breakCompliance(sessions, cfg, Date.now(), null, emp);
+      const needs = (comp.meal1 && !comp.meal1.ok) || comp.restsOwed > comp.restsTaken;
+      if (!needs) return false;
+      setBreakAsk({ emp, comp, day: dayKey(dStart), ev });
+      return true;
+    },
+    [cfg]
+  );
+
+  const submitBreakAttest = async (answers) => {
+    if (!breakAsk) return;
+    const { emp, day, ev } = breakAsk;
+    await addEvent(emp.id, "breakAttest", ev.ts + 1, null, {
+      day,
+      meal1: answers.meal1 || null,
+      rest: answers.rest || null,
+      note: answers.note || "",
+    });
+    setBreakAsk(null);
+    const owed = answers.meal1 === "denied" || answers.rest === "denied";
+    flash(
+      owed ? "Logged — an hour of premium pay was flagged for you" : "Thanks, logged",
+      owed ? "out" : "in"
+    );
+    if (cfg.attestation) await maybeReview(emp, "out", ev);
+  };
+
+  /* Sign-off is due when someone clocks out on the last day of the pay period.
+     If they miss it, we catch them at the next punch instead of losing it. */
+  const maybeReview = useCallback(
+    async (emp, type, ev) => {
+      const when = new Date(ev.ts);
+      let target = null;
+
+      if (type === "out" && isLastDayOfPeriod(cfg, when)) {
+        target = startOfWeek(when, cfg.weekStart);
+      } else {
+        const prior = startOfWeek(addDays(when, -7), cfg.weekStart);
+        const priorEnd = addDays(prior, 7).getTime();
+        if (when.getTime() >= priorEnd) target = prior;
+      }
+      if (!target) return;
+
+      const key = attestKeyFor(dayKey(target), emp.id);
+      const already = await sGet(key, null);
+      if (already) return;
+
+      // read from the ref, not state — the clock-out that triggered this
+      // review was written milliseconds ago and must be included
+      const evs = Object.values(monthsRef.current)
+        .flat()
+        .filter((x) => x.empId === emp.id);
+      const summary = periodSummary(evs, cfg, target, Date.now());
+      if (summary.totals.total === 0) return;
+
+      setReview({ emp, periodStartDate: target, summary, key });
+    },
+    [cfg]
+  );
+
+  const submitReview = async ({ agreed, signature, note }) => {
+    if (!review) return;
+    const { emp, periodStartDate, summary, key } = review;
+    const pStart = dayKey(periodStartDate);
+    const record = {
+      empId: emp.id,
+      empName: emp.name,
+      periodStart: pStart,
+      periodEnd: dayKey(periodEnd(cfg, periodStartDate)),
+      signedAt: Date.now(),
+      agreed,
+      note: note || "",
+      totals: summary.totals,
+      dayHours: summary.rows.map((r) => ({ d: dayKey(r.date), h: r.hours })),
+    };
+    if (signature) {
+      const sk = signKeyFor(pStart, emp.id);
+      const ok = await sSet(sk, signature);
+      if (ok) record.signatureKey = sk;
+    }
+    await sSet(key, record);
+    setReview(null);
+    flash(
+      agreed ? "Signed — thanks, hours confirmed" : "Sent to your manager for review",
+      agreed ? "in" : "out"
+    );
+  };
+
+  if (!ready) {
+    return (
+      <div className="root">
+        <Styles />
+        <div className="bootWrap">
+          <div className="bootPulse" />
+          <p className="bootTxt">Opening the shop…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === "setup") {
+    return (
+      <div className="root">
+        <Styles />
+        <Setup
+          cfg={cfg}
+          onDone={async (next) => {
+            await saveCfg(next);
+            setScreen("kiosk");
+          }}
+        />
+      </div>
+    );
+  }
+
+  if (screen === "manager") {
+    return (
+      <div className="root">
+        <Styles />
+        <Manager
+          cfg={cfg}
+          employees={employees}
+          months={months}
+          loadMonth={loadMonth}
+          updateEvents={updateEvents}
+          saveCfg={saveCfg}
+          saveEmployees={saveEmployees}
+          onExit={() => setScreen("kiosk")}
+          flash={flash}
+          now={now}
+        />
+        <Toast text={toast?.text} tone={toast?.tone} />
+      </div>
+    );
+  }
+
+  const active = employees.filter((e) => e.active !== false);
+  const nowDate = new Date(now);
+
+  return (
+    <div className="root">
+      <Styles />
+
+      <header className="bar">
+        <div className="barLeft">
+          <h1 className="shopName">{cfg.shopName}</h1>
+          <p className="barDate">{fmtDateLong(nowDate)}</p>
+        </div>
+        <div className="barRight">
+          <div className="bigClock">{fmtTime(nowDate)}</div>
+          <div className="onNow">
+            {active.filter((e) => statusOf(e.id).state !== "out").length} on the clock
+          </div>
+        </div>
+      </header>
+
+      {cfg.breakRules &&
+        (() => {
+          const alerts = active
+            .map((e) => ({ emp: e, due: dueFor(e.id) }))
+            .filter(
+              (a) =>
+                a.due &&
+                (a.due.kind === "meal1" || a.due.kind === "meal2") &&
+                a.due.remaining < cfg.breakReminderMin * 60000
+            )
+            .sort((a, b) => a.due.remaining - b.due.remaining);
+          if (!alerts.length) return null;
+          return (
+            <div className="floorAlert">
+              {alerts.map(({ emp, due }) => (
+                <span key={emp.id} className={`floorItem ${due.remaining < 0 ? "over" : ""}`}>
+                  <strong>{emp.name.split(" ")[0]}</strong>
+                  {due.remaining < 0
+                    ? ` — lunch is past the legal cutoff of ${fmtTime(new Date(due.dueAt))}`
+                    : ` — lunch due in ${Math.max(0, Math.round(due.remaining / 60000))} min`}
+                </span>
+              ))}
+            </div>
+          );
+        })()}
+
+      {active.length === 0 ? (
+        <div className="empty">
+          <h2>No one on the roster yet</h2>
+          <p>Add your technicians and give each one a 4-digit PIN. Then they can punch in here.</p>
+          <button className="btn primary lg" onClick={() => setManagerPin(true)}>
+            Add your team
+          </button>
+        </div>
+      ) : (
+        <main className="grid">
+          {active.map((emp) => {
+            const st = statusOf(emp.id);
+            const worked = todayMs(emp.id);
+            const due = cfg.breakRules ? dueFor(emp.id) : null;
+            return (
+              <button
+                key={emp.id}
+                className={`tile ${st.state}`}
+                onClick={() => handleEmployeeTap(emp)}
+              >
+                <span className="tileRule" />
+                <span className="tileTop">
+                  <span className="tileName">{emp.name}</span>
+                  <span className="tileRole">{emp.role || "Technician"}</span>
+                </span>
+
+                <DayBar
+                  cfg={cfg}
+                  sessions={buildSessions(
+                    eventsFor(emp.id).filter((e) => {
+                      const s = new Date();
+                      s.setHours(0, 0, 0, 0);
+                      return e.ts >= s.getTime();
+                    }),
+                    cfg
+                  )}
+                  now={now}
+                />
+
+                <span className="tileBottom">
+                  <span className={`pill ${st.state}`}>
+                    {st.state === "in"
+                      ? "On the clock"
+                      : st.state === "meal"
+                      ? "At lunch"
+                      : st.state === "rest"
+                      ? "Rest break"
+                      : "Out"}
+                  </span>
+                  <span className="tileHrs">{hoursText(worked)} today</span>
+                </span>
+
+                {due && (
+                  <span
+                    className={`tileDue ${
+                      due.kind === "onMeal" || due.kind === "onRest"
+                        ? "timer"
+                        : due.remaining < 0
+                        ? "over"
+                        : due.remaining < cfg.breakReminderMin * 60000
+                        ? "soon"
+                        : ""
+                    }`}
+                  >
+                    {due.kind === "onMeal"
+                      ? due.remaining > 0
+                        ? `${Math.ceil(due.remaining / 60000)} min left of lunch`
+                        : "Full lunch taken"
+                      : due.kind === "onRest"
+                      ? due.remaining > 0
+                        ? `${Math.ceil(due.remaining / 60000)} min left of rest break`
+                        : "Rest break complete"
+                      : due.remaining < 0
+                      ? `${due.label} — past ${fmtTime(new Date(due.dueAt))}`
+                      : `${due.label} by ${fmtTime(new Date(due.dueAt))}`}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </main>
+      )}
+
+      <footer className="foot">
+        <button className="linkBtn" onClick={() => setManagerPin(true)}>
+          Manager
+        </button>
+        <span className="footNote">Tap your name to punch in or out</span>
+      </footer>
+
+      {pinFor && (
+        <Keypad
+          title={pinFor.name}
+          subtitle="Enter your 4-digit PIN"
+          error={pinErr}
+          onSubmit={submitEmployeePin}
+          onCancel={closePunchFlow}
+          cam={cfg.photos ? cam : null}
+        />
+      )}
+
+      {managerPin && (
+        <Keypad
+          title="Manager"
+          subtitle="Enter the manager PIN"
+          error={pinErr}
+          onSubmit={(v) => {
+            if (v === cfg.managerPin) {
+              setManagerPin(false);
+              setPinErr("");
+              setScreen("manager");
+            } else {
+              setPinErr("Wrong PIN.");
+            }
+          }}
+          onCancel={() => {
+            setManagerPin(false);
+            setPinErr("");
+          }}
+        />
+      )}
+
+      {actionFor && (
+        <ActionSheet
+          emp={actionFor}
+          status={statusOf(actionFor.id)}
+          worked={todayMs(actionFor.id)}
+          onPunch={doPunch}
+          onCancel={closePunchFlow}
+          cam={cfg.photos ? cam : null}
+          due={cfg.breakRules ? dueFor(actionFor.id) : null}
+          now={now}
+          cfg={cfg}
+          onSchedule={() => {
+            setShowSchedule(actionFor);
+            setActionFor(null);
+            cam.stop();
+          }}
+        />
+      )}
+
+      {showSchedule && (
+        <MySchedule
+          emp={showSchedule}
+          cfg={cfg}
+          onClose={() => setShowSchedule(null)}
+        />
+      )}
+
+      {breakAsk && (
+        <BreakAttest
+          emp={breakAsk.emp}
+          comp={breakAsk.comp}
+          onSubmit={submitBreakAttest}
+          onSkip={() => setBreakAsk(null)}
+        />
+      )}
+
+      {review && (
+        <ReviewSheet
+          emp={review.emp}
+          cfg={cfg}
+          summary={review.summary}
+          periodStartDate={review.periodStartDate}
+          onSubmit={submitReview}
+          onDefer={() => setReview(null)}
+        />
+      )}
+
+      <Toast text={toast?.text} tone={toast?.tone} />
+    </div>
+  );
+}
+
+/* ---------- day bar (shop hours timeline) ---------- */
+function DayBar({ cfg, sessions, now }) {
+  const start = new Date();
+  start.setHours(cfg.openHour, 0, 0, 0);
+  const end = new Date();
+  end.setHours(cfg.closeHour, 0, 0, 0);
+  const span = end - start;
+  if (span <= 0) return null;
+  const segs = [];
+  sessions.forEach((s, i) => {
+    const a = Math.max(s.start, start.getTime());
+    const b = Math.min(s.end != null ? s.end : now, end.getTime());
+    if (b > a) {
+      segs.push({
+        key: `w${i}`,
+        left: ((a - start.getTime()) / span) * 100,
+        width: ((b - a) / span) * 100,
+        kind: "work",
+      });
+    }
+    [
+      ["meal", s.meals || []],
+      ["rest", s.rests || []],
+    ].forEach(([kind, list]) => {
+      list.forEach((br, j) => {
+        const ba = Math.max(br.start, start.getTime());
+        const bb = Math.min(br.end, end.getTime());
+        if (bb > ba)
+          segs.push({
+            key: `${kind}${i}-${j}`,
+            left: ((ba - start.getTime()) / span) * 100,
+            width: ((bb - ba) / span) * 100,
+            kind,
+          });
+      });
+    });
+  });
+  const nowPct = ((now - start.getTime()) / span) * 100;
+  return (
+    <span className="daybar">
+      <span className="daybarTrack" />
+      {segs.map((s) => (
+        <span
+          key={s.key}
+          className={`daybarSeg ${s.kind}`}
+          style={{ left: `${s.left}%`, width: `${Math.max(s.width, 0.6)}%` }}
+        />
+      ))}
+      {nowPct >= 0 && nowPct <= 100 && (
+        <span className="daybarNow" style={{ left: `${nowPct}%` }} />
+      )}
+      <span className="daybarEnds">
+        <em>{cfg.openHour % 12 || 12}a</em>
+        <em>{cfg.closeHour > 12 ? cfg.closeHour - 12 : cfg.closeHour}p</em>
+      </span>
+    </span>
+  );
+}
+
+/* ---------- action sheet ---------- */
+function ActionSheet({ emp, status, worked, onPunch, onCancel, cam, due, now, cfg, onSchedule }) {
+  const isOut = status.state === "out";
+  const onMeal = status.state === "meal";
+  const onRest = status.state === "rest";
+  const onClock = !isOut && !onMeal && !onRest;
+
+  const mealElapsed = onMeal ? now - status.since : 0;
+  const restElapsed = onRest ? now - status.since : 0;
+  const mealShort = onMeal && mealElapsed < MEAL_MIN_MS - 30000;
+  const [confirmShort, setConfirmShort] = useState(false);
+
+  const mealLeft = Math.max(0, MEAL_MIN_MS - mealElapsed);
+  const restLeft = Math.max(0, REST_MIN_MS - restElapsed);
+  const mmss = (ms) =>
+    `${Math.floor(ms / 60000)}:${pad2(Math.floor((ms % 60000) / 1000))}`;
+
+  return (
+    <div className="overlay">
+      <div className="actCard">
+        <button className="closeX" onClick={onCancel} aria-label="Cancel">
+          ✕
+        </button>
+        {cam && <CameraFeed cam={cam} size="lg" />}
+        <h2 className="actName">{emp.name}</h2>
+        <p className="actMeta">
+          {isOut
+            ? "Not on the clock"
+            : onMeal
+            ? `On lunch since ${fmtTime(new Date(status.since))}`
+            : onRest
+            ? `On rest break since ${fmtTime(new Date(status.since))}`
+            : `Clocked in at ${fmtTime(new Date(status.since))} · ${hoursText(worked)} today`}
+        </p>
+
+        {onMeal && (
+          <div className={`breakTimer ${mealShort ? "short" : "done"}`}>
+            <strong>{mealShort ? mmss(mealLeft) : "30:00+"}</strong>
+            <span>
+              {mealShort
+                ? "left before your lunch counts as a full 30"
+                : cfg?.mealPay === "always"
+                ? "you've had a full lunch — head back whenever you're ready"
+                : "you've had a full lunch — clock back in when ready"}
+            </span>
+          </div>
+        )}
+        {onRest && (
+          <div className={`breakTimer ${restLeft > 0 ? "short" : "done"}`}>
+            <strong>{restLeft > 0 ? mmss(restLeft) : "10:00+"}</strong>
+            <span>
+              {restLeft > 0 ? "left on your paid rest break" : "rest break complete"}
+            </span>
+          </div>
+        )}
+
+        {onClock && due && due.remaining < 60 * 60000 && (
+          <div className={`dueBanner ${due.remaining < 0 ? "over" : ""}`}>
+            {due.remaining < 0
+              ? `${due.label} — it's past the legal cutoff of ${fmtTime(new Date(due.dueAt))}`
+              : `${due.label} by ${fmtTime(new Date(due.dueAt))} · ${Math.round(
+                  due.remaining / 60000
+                )} min left`}
+          </div>
+        )}
+
+        <div className="actBtns">
+          {isOut && (
+            <button className="bigAct in" onClick={() => onPunch("in")}>
+              Clock in
+            </button>
+          )}
+          {onClock && (
+            <>
+              <button className="bigAct meal" onClick={() => onPunch("mealStart")}>
+                Start lunch
+                <em>
+                  {cfg?.mealPay === "always"
+                    ? "30 minutes, paid — you're free to leave"
+                    : "30 minutes, off the clock"}
+                </em>
+              </button>
+              <button className="bigAct brk" onClick={() => onPunch("restStart")}>
+                Start rest break
+                <em>10 minutes, paid — stay on the clock</em>
+              </button>
+              <button className="bigAct out" onClick={() => onPunch("out")}>
+                Clock out
+              </button>
+            </>
+          )}
+          {onMeal && !confirmShort && (
+            <button
+              className="bigAct in"
+              onClick={() => (mealShort ? setConfirmShort(true) : onPunch("mealEnd"))}
+            >
+              Back from lunch
+            </button>
+          )}
+          {onMeal && confirmShort && (
+            <div className="shortWarn">
+              <p>
+                That's only {Math.floor(mealElapsed / 60000)} minutes. California requires a full 30,
+                and coming back early can cost the shop an hour of premium pay.
+              </p>
+              <button className="bigAct in" onClick={() => setConfirmShort(false)}>
+                Finish my lunch
+              </button>
+              <button className="bigAct out" onClick={() => onPunch("mealEnd")}>
+                Go back to work anyway
+              </button>
+            </div>
+          )}
+          {onRest && (
+            <button className="bigAct in" onClick={() => onPunch("restEnd")}>
+              Back from rest break
+            </button>
+          )}
+          {(onMeal || onRest) && !confirmShort && (
+            <button className="bigAct out" onClick={() => onPunch("out")}>
+              Clock out for the day
+            </button>
+          )}
+          {!confirmShort && (
+            <button className="linkBtn wide" onClick={onSchedule}>
+              See my schedule
+            </button>
+          )}
+        </div>
+        {cam && cam.state !== "live" && (
+          <p className="camNote">{CAM_MSG[cam.state] || "Camera off"}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- setup ---------- */
+function Setup({ cfg, onDone }) {
+  const [name, setName] = useState(cfg.shopName || "");
+  const [pin, setPin] = useState("");
+  const [pin2, setPin2] = useState("");
+  const [err, setErr] = useState("");
+  const go = () => {
+    if (!name.trim()) return setErr("Give the shop a name.");
+    if (!/^\d{4}$/.test(pin)) return setErr("The manager PIN needs to be 4 digits.");
+    if (pin !== pin2) return setErr("The two PINs don't match.");
+    onDone({ ...cfg, shopName: name.trim(), managerPin: pin });
+  };
+  return (
+    <div className="setupWrap">
+      <div className="setupCard">
+        <h1 className="setupTitle">Set up the time clock</h1>
+        <p className="setupLead">
+          This runs on the shop iPad. Your crew taps their name and enters a PIN to punch in and out.
+        </p>
+        <label className="fld">
+          <span>Shop name</span>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Shop name" />
+        </label>
+        <label className="fld">
+          <span>Manager PIN</span>
+          <input
+            value={pin}
+            onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 4))}
+            inputMode="numeric"
+            placeholder="4 digits"
+          />
+        </label>
+        <label className="fld">
+          <span>Confirm manager PIN</span>
+          <input
+            value={pin2}
+            onChange={(e) => setPin2(e.target.value.replace(/\D/g, "").slice(0, 4))}
+            inputMode="numeric"
+            placeholder="4 digits"
+          />
+        </label>
+        {err && <p className="fldErr">{err}</p>}
+        <button className="btn primary lg full" onClick={go}>
+          Start the clock
+        </button>
+        <p className="setupNote">
+          The manager PIN opens timecards, the roster, and settings. Keep it off the shop floor.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- manager ---------- */
+function Manager({
+  cfg,
+  employees,
+  months,
+  loadMonth,
+  updateEvents,
+  saveCfg,
+  saveEmployees,
+  onExit,
+  flash,
+  now,
+}) {
+  const [tab, setTab] = useState("timecards");
+  return (
+    <div className="mgr">
+      <header className="mgrBar">
+        <div className="mgrTabs">
+          {[
+            ["timecards", "Timecards"],
+            ["schedule", "Schedule"],
+            ["roster", "Roster"],
+            ["settings", "Settings"],
+          ].map(([k, label]) => (
+            <button
+              key={k}
+              className={`mgrTab ${tab === k ? "on" : ""}`}
+              onClick={() => setTab(k)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <button className="btn ghost" onClick={onExit}>
+          Back to the clock
+        </button>
+      </header>
+
+      {tab === "timecards" && (
+        <Timecards
+          cfg={cfg}
+          employees={employees}
+          months={months}
+          loadMonth={loadMonth}
+          updateEvents={updateEvents}
+          now={now}
+          flash={flash}
+        />
+      )}
+      {tab === "schedule" && (
+        <ScheduleBuilder cfg={cfg} employees={employees} flash={flash} />
+      )}
+      {tab === "roster" && (
+        <Roster employees={employees} saveEmployees={saveEmployees} flash={flash} cfg={cfg} />
+      )}
+      {tab === "settings" && <Settings cfg={cfg} saveCfg={saveCfg} flash={flash} />}
+    </div>
+  );
+}
+
+/* ---------- schedule builder ---------- */
+function ScheduleBuilder({ cfg, employees, flash }) {
+  const [offset, setOffset] = useState(0);
+  const [sched, setSched] = useState(undefined);
+  const [editing, setEditing] = useState(null);
+  const weekStart = addDays(startOfWeek(new Date(), cfg.weekStart), offset * 7);
+  const key = schedKeyFor(dayKey(weekStart));
+  const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+  const roster = employees.filter((e) => e.active !== false);
+
+  useEffect(() => {
+    let dead = false;
+    setSched(undefined);
+    (async () => {
+      const s = await sGet(key, null);
+      if (!dead) setSched(s || { published: false, shifts: {} });
+    })();
+    return () => {
+      dead = true;
+    };
+  }, [key]);
+
+  const persist = async (next) => {
+    setSched(next);
+    await sSet(key, next);
+  };
+
+  const setShift = async (empId, dKey, shift) => {
+    const next = { ...sched, shifts: { ...(sched.shifts || {}) } };
+    const forEmp = { ...(next.shifts[empId] || {}) };
+    if (shift) forEmp[dKey] = shift;
+    else delete forEmp[dKey];
+    next.shifts[empId] = forEmp;
+    await persist(next);
+  };
+
+  const copyLastWeek = async () => {
+    const prev = await sGet(schedKeyFor(dayKey(addDays(weekStart, -7))), null);
+    if (!prev || !prev.shifts) return flash("Nothing to copy from last week", "out");
+    const shifts = {};
+    for (const [empId, byDay] of Object.entries(prev.shifts)) {
+      shifts[empId] = {};
+      for (const [dk, sh] of Object.entries(byDay)) {
+        const shifted = dayKey(addDays(new Date(`${dk}T12:00:00`), 7));
+        shifts[empId][shifted] = sh;
+      }
+    }
+    await persist({ ...sched, shifts });
+    flash("Copied last week's schedule");
+  };
+
+  const clearWeek = async () => {
+    await persist({ ...sched, shifts: {} });
+    flash("Week cleared");
+  };
+
+  const togglePublish = async () => {
+    const now = Date.now();
+    const next = { ...sched, published: !sched.published, publishedAt: now };
+    await persist(next);
+    flash(next.published ? "Schedule posted — your crew can see it" : "Schedule unposted");
+  };
+
+  if (sched === undefined) return <div className="pane"><p className="muted">Loading…</p></div>;
+
+  const empHours = (empId) =>
+    days.reduce((a, d) => a + shiftHours(sched.shifts?.[empId]?.[dayKey(d)], cfg), 0);
+  const dayHeads = (d) =>
+    roster.filter((e) => sched.shifts?.[e.id]?.[dayKey(d)]).length;
+  const weekTotal = roster.reduce((a, e) => a + empHours(e.id), 0);
+
+  return (
+    <div className="pane">
+      <div className="weekNav">
+        <button className="btn ghost" onClick={() => setOffset((o) => o - 1)}>
+          ‹ Previous
+        </button>
+        <div className="weekLabel">
+          <strong>
+            {weekStart.toLocaleDateString(undefined, { month: "short", day: "numeric" })} –{" "}
+            {addDays(weekStart, 6).toLocaleDateString(undefined, {
+              month: "short",
+              day: "numeric",
+            })}
+          </strong>
+          <span>
+            {offset === 0 ? "This week" : offset === 1 ? "Next week" : `${offset} weeks out`}
+          </span>
+        </div>
+        <button className="btn ghost" onClick={() => setOffset((o) => o + 1)}>
+          Next ›
+        </button>
+        <button className="btn" onClick={copyLastWeek}>
+          Copy last week
+        </button>
+        <button className={`btn ${sched.published ? "" : "primary"}`} onClick={togglePublish}>
+          {sched.published ? "Unpost" : "Post to the crew"}
+        </button>
+      </div>
+
+      <div className={`postState ${sched.published ? "live" : ""}`}>
+        {sched.published
+          ? "Posted. Your crew sees this when they tap their name and enter their PIN. Any change you make here shows up right away."
+          : "Not posted yet. Nobody can see this until you post it."}
+      </div>
+
+      {roster.length === 0 ? (
+        <p className="muted pad">Add people to the roster first.</p>
+      ) : (
+        <div className="tableWrap">
+          <table className="tc sched">
+            <thead>
+              <tr>
+                <th className="stick">Name</th>
+                {days.map((d) => (
+                  <th key={dayKey(d)}>
+                    {d.toLocaleDateString(undefined, { weekday: "short" })}
+                    <em>{d.getDate()}</em>
+                  </th>
+                ))}
+                <th>Hours</th>
+              </tr>
+            </thead>
+            <tbody>
+              {roster.map((e) => {
+                const hrs = empHours(e.id);
+                return (
+                  <tr key={e.id}>
+                    <td className="stick nameCell">{e.name}</td>
+                    {days.map((d) => {
+                      const k = dayKey(d);
+                      const sh = sched.shifts?.[e.id]?.[k];
+                      return (
+                        <td key={k} className="cellPad">
+                          <button
+                            className={`schedCell ${sh ? "on" : ""}`}
+                            onClick={() => setEditing({ emp: e, dKey: k, date: d, shift: sh })}
+                          >
+                            {sh ? (
+                              <>
+                                <span>
+                                  {fmtHHMM(sh.start)}–{fmtHHMM(sh.end)}
+                                </span>
+                                {sh.note && <em>{sh.note}</em>}
+                              </>
+                            ) : (
+                              <span className="addMark">+</span>
+                            )}
+                          </button>
+                        </td>
+                      );
+                    })}
+                    <td className={`num tot ${hrs > 40 ? "ot" : ""}`}>{hrs.toFixed(1)}</td>
+                  </tr>
+                );
+              })}
+              <tr className="coverRow">
+                <td className="stick">On the floor</td>
+                {days.map((d) => {
+                  const n = dayHeads(d);
+                  return (
+                    <td
+                      key={dayKey(d)}
+                      className={n > 0 && n < cfg.minStaff ? "hot" : n === 0 ? "zero" : ""}
+                    >
+                      {n === 0 ? "—" : n}
+                    </td>
+                  );
+                })}
+                <td className="num tot">{weekTotal.toFixed(1)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {(() => {
+        const thin = days.filter((d) => {
+          const n = dayHeads(d);
+          return n > 0 && n < cfg.minStaff;
+        });
+        const over = roster.filter((e) => empHours(e.id) > 40);
+        if (!thin.length && !over.length) return null;
+        return (
+          <div className="schedWarn">
+            {thin.length > 0 && (
+              <p>
+                Below your {cfg.minStaff}-person floor minimum on{" "}
+                {thin.map((d) => d.toLocaleDateString(undefined, { weekday: "long" })).join(", ")}.
+              </p>
+            )}
+            {over.map((e) => (
+              <p key={e.id}>
+                {e.name} is scheduled {empHours(e.id).toFixed(1)} hours — anything past 40 comes back
+                at time and a half.
+              </p>
+            ))}
+          </div>
+        );
+      })()}
+
+      <div className="schedFoot">
+        <button className="btn tiny danger" onClick={clearWeek}>
+          Clear this week
+        </button>
+      </div>
+
+      {editing && (
+        <ShiftEditor
+          cfg={cfg}
+          entry={editing}
+          onSave={(sh) => {
+            setShift(editing.emp.id, editing.dKey, sh);
+            setEditing(null);
+          }}
+          onClose={() => setEditing(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ShiftEditor({ cfg, entry, onSave, onClose }) {
+  const existing = entry.shift;
+  const [start, setStart] = useState(existing?.start || `${pad2(cfg.openHour)}:00`);
+  const [end, setEnd] = useState(existing?.end || `${pad2(cfg.closeHour)}:00`);
+  const [lunch, setLunch] = useState(existing?.lunch ?? 30);
+  const [note, setNote] = useState(existing?.note || "");
+
+  const preview = shiftHours({ start, end, lunch }, cfg);
+  const bad = preview <= 0;
+
+  return (
+    <div className="overlay">
+      <div className="editCard">
+        <button className="closeX" onClick={onClose} aria-label="Close">
+          ✕
+        </button>
+        <h2 className="editTitle">{entry.emp.name}</h2>
+        <p className="muted">
+          {entry.date.toLocaleDateString(undefined, {
+            weekday: "long",
+            month: "long",
+            day: "numeric",
+          })}
+        </p>
+
+        <div className="presetRow">
+          {SHIFT_PRESETS.map((p) => (
+            <button
+              key={p.label}
+              className="btn tiny"
+              onClick={() => {
+                setStart(p.start);
+                setEnd(p.end);
+                setLunch(p.lunch);
+              }}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="fldRow">
+          <label className="fld">
+            <span>Starts</span>
+            <input type="time" value={start} onChange={(e) => setStart(e.target.value)} />
+          </label>
+          <label className="fld">
+            <span>Ends</span>
+            <input type="time" value={end} onChange={(e) => setEnd(e.target.value)} />
+          </label>
+        </div>
+        <div className="fldRow">
+          <label className="fld">
+            <span>Unpaid lunch</span>
+            <select value={lunch} onChange={(e) => setLunch(Number(e.target.value))}>
+              <option value={0}>None</option>
+              <option value={30}>30 minutes</option>
+              <option value={45}>45 minutes</option>
+              <option value={60}>60 minutes</option>
+            </select>
+          </label>
+          <label className="fld">
+            <span>Note (they'll see this)</span>
+            <input
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder="Cover front counter"
+            />
+          </label>
+        </div>
+
+        <p className={`shiftPreview ${bad ? "bad" : ""}`}>
+          {bad ? "End time has to come after the start." : `${preview.toFixed(2)} paid hours`}
+          {!bad && preview > 8 ? " · over 8, so daily overtime kicks in" : ""}
+        </p>
+
+        <button
+          className="btn primary lg full"
+          disabled={bad}
+          onClick={() => onSave({ start, end, lunch, note: note.trim() })}
+        >
+          {existing ? "Save shift" : "Add shift"}
+        </button>
+        {existing && (
+          <button className="linkBtn wide" onClick={() => onSave(null)}>
+            Remove this shift
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- timecards ---------- */
+function Timecards({ cfg, employees, months, loadMonth, updateEvents, now, flash }) {
+  const [weekOffset, setWeekOffset] = useState(0);
+  const [openEmp, setOpenEmp] = useState(null);
+  const [csv, setCsv] = useState(null);
+  const [editing, setEditing] = useState(null);
+  const [attest, setAttest] = useState({});
+  const [viewSign, setViewSign] = useState(null);
+  const [breakDetail, setBreakDetail] = useState(null);
+  const [view, setView] = useState("hours"); // hours | variance
+  const [sched, setSched] = useState(null);
+  const [varDetail, setVarDetail] = useState(null);
+
+  const weekStartDate = addDays(startOfWeek(new Date(), cfg.weekStart), weekOffset * 7);
+  const weekEndDate = addDays(weekStartDate, 6);
+  const wStart = weekStartDate.getTime();
+  const wEnd = addDays(weekStartDate, 7).getTime();
+
+  useEffect(() => {
+    loadMonth(ym(weekStartDate));
+    loadMonth(ym(weekEndDate));
+  }, [weekOffset]); // eslint-disable-line
+
+  useEffect(() => {
+    let dead = false;
+    (async () => {
+      const s = await sGet(schedKeyFor(dayKey(weekStartDate)), null);
+      if (!dead) setSched(s);
+    })();
+    return () => {
+      dead = true;
+    };
+  }, [weekOffset]); // eslint-disable-line
+
+  useEffect(() => {
+    let dead = false;
+    (async () => {
+      const pStart = dayKey(weekStartDate);
+      const found = {};
+      for (const e of employees) {
+        const rec = await sGet(attestKeyFor(pStart, e.id), null);
+        if (rec) found[e.id] = rec;
+      }
+      if (!dead) setAttest(found);
+    })();
+    return () => {
+      dead = true;
+    };
+  }, [weekOffset, employees]); // eslint-disable-line
+
+  const all = Object.values(months).flat();
+  const days = Array.from({ length: 7 }, (_, i) => addDays(weekStartDate, i));
+
+  const rowFor = (emp) => {
+    const evs = all.filter((e) => e.empId === emp.id).sort((a, b) => a.ts - b.ts);
+    const attests = evs.filter((e) => e.type === "breakAttest");
+    const sessions = buildSessions(evs, cfg).filter((s) => s.start >= wStart && s.start < wEnd);
+    const byDay = {};
+    for (const s of sessions) {
+      const k = dayKey(new Date(s.start));
+      byDay[k] = byDay[k] || { ms: 0, breakMs: 0, sessions: [] };
+      byDay[k].ms += sessionWorkedMs(s, cfg, now);
+      byDay[k].breakMs += sessionBreakMs(s, now);
+      byDay[k].sessions.push(s);
+    }
+    const dayHours = days.map((d) => decHours(byDay[dayKey(d)]?.ms || 0));
+    const totals = weekTotals(dayHours, cfg.otRules);
+    const paidMealMs = sessions.reduce((a, s) => a + sessionPaidMealMs(s, cfg), 0);
+    const paidMealCount = sessions.reduce(
+      (a, s) => a + s.meals.filter((m) => mealIsPaid(m, cfg)).length,
+      0
+    );
+
+    let mealPrem = 0,
+      restPrem = 0;
+    const flags = [];
+    if (cfg.breakRules) {
+      for (const d of days) {
+        const k = dayKey(d);
+        const info = byDay[k];
+        if (!info) continue;
+        const att = attests.find((a) => a.payload?.day === k)?.payload || null;
+        const comp = breakCompliance(info.sessions, cfg, now, att, emp);
+        info.comp = comp;
+        info.attested = !!att;
+        mealPrem += comp.mealPremium;
+        restPrem += comp.restPremium;
+        if (comp.issues.length) flags.push({ day: k, date: d, comp, att });
+      }
+    }
+
+    const anomalies = sessions.filter((s) => s.missingOut).length;
+
+    /* --- scheduled vs actual --- */
+    const grace = (cfg.graceMin || 0) * 60000;
+    const mine = sched?.shifts?.[emp.id] || {};
+    const variance = days.map((d, i) => {
+      const k = dayKey(d);
+      const shift = mine[k];
+      const schedH = shiftHours(shift, cfg);
+      const actualH = dayHours[i];
+      const info = byDay[k];
+      const row = {
+        date: d,
+        day: k,
+        shift,
+        schedH,
+        actualH,
+        diff: Math.round((actualH - schedH) * 100) / 100,
+        notes: [],
+        kind: null,
+      };
+      if (shift && actualH === 0) {
+        row.notes.push("Scheduled but never clocked in");
+        row.kind = "noshow";
+      } else if (!shift && actualH > 0) {
+        row.notes.push("Worked without being on the schedule");
+        row.kind = "unscheduled";
+      } else if (shift && info) {
+        const firstIn = Math.min(...info.sessions.map((s) => s.start));
+        const lastOut = Math.max(
+          ...info.sessions.map((s) => (s.end != null ? s.end : s.start))
+        );
+        const sStart = schedTs(d, shift.start);
+        const sEnd = schedTs(d, shift.end, sStart);
+        if (sStart && firstIn > sStart + grace)
+          row.notes.push(`In ${Math.round((firstIn - sStart) / 60000)} min late`);
+        if (sStart && firstIn < sStart - grace)
+          row.notes.push(`In ${Math.round((sStart - firstIn) / 60000)} min early`);
+        if (sEnd && lastOut > sEnd + grace)
+          row.notes.push(`Stayed ${Math.round((lastOut - sEnd) / 60000)} min past the end`);
+        if (sEnd && lastOut < sEnd - grace)
+          row.notes.push(`Left ${Math.round((sEnd - lastOut) / 60000)} min early`);
+        if (row.notes.length) row.kind = row.diff > 0 ? "over" : "under";
+      }
+      return row;
+    });
+    const schedTotal = Math.round(variance.reduce((a, v) => a + v.schedH, 0) * 100) / 100;
+    const varTotal = Math.round((totals.total - schedTotal) * 100) / 100;
+
+    return {
+      byDay,
+      dayHours,
+      totals,
+      anomalies,
+      sessions,
+      mealPrem,
+      restPrem,
+      flags,
+      paidMealMs,
+      paidMealCount,
+      variance,
+      schedTotal,
+      varTotal,
+    };
+  };
+
+  const rows = employees.map((e) => ({ emp: e, ...rowFor(e) }));
+  const buildCsv = () => {
+    const lines = [
+      [
+        "Employee",
+        "Date",
+        "Clock in",
+        "Clock out",
+        "Lunch (min)",
+        "Lunch paid",
+        "Rest breaks",
+        "Hours",
+        "Scheduled",
+        "Variance",
+        "Regular",
+        "OT",
+        "Double",
+        "Meal premium",
+        "Rest premium",
+        "Break note",
+      ].join(","),
+    ];
+    for (const r of rows) {
+      days.forEach((d, i) => {
+        const k = dayKey(d);
+        const info = r.byDay[k];
+        if (!info) return;
+        const split = splitDay(r.dayHours[i], cfg.otRules);
+        const comp = info.comp;
+        info.sessions.forEach((s, si) => {
+          lines.push(
+            [
+              `"${r.emp.name}"`,
+              k,
+              fmtTime(new Date(s.start)),
+              s.end ? fmtTime(new Date(s.end)) : s.missingOut ? "MISSING" : "still in",
+              Math.round(sessionMealMs(s, now) / 60000),
+              s.meals.some((m) => mealIsPaid(m, cfg))
+                ? "paid"
+                : s.meals.length
+                ? "unpaid"
+                : "",
+              s.rests.length,
+              si === 0 ? r.dayHours[i] : "",
+              si === 0 ? r.variance[i].schedH.toFixed(2) : "",
+              si === 0 ? r.variance[i].diff.toFixed(2) : "",
+              si === 0 ? split.reg.toFixed(2) : "",
+              si === 0 ? split.ot.toFixed(2) : "",
+              si === 0 ? split.dt.toFixed(2) : "",
+              si === 0 && comp ? comp.mealPremium : "",
+              si === 0 && comp ? comp.restPremium : "",
+              si === 0 && comp && comp.issues.length ? `"${comp.issues.join("; ")}"` : "",
+            ].join(",")
+          );
+        });
+      });
+      lines.push(
+        [
+          `"${r.emp.name}"`,
+          "WEEK TOTAL",
+          "",
+          "",
+          "",
+          "",
+          "",
+          r.totals.total,
+          r.schedTotal.toFixed(2),
+          r.varTotal.toFixed(2),
+          r.totals.reg,
+          r.totals.ot,
+          r.totals.dt,
+          r.mealPrem,
+          r.restPrem,
+          "",
+        ].join(",")
+      );
+    }
+    setCsv(lines.join("\n"));
+  };
+
+  const togglePaidMeal = async (ev) => {
+    const key = ym(new Date(ev.ts));
+    const list = (months[key] || []).map((x) =>
+      x.id === ev.id ? { ...x, paidMeal: !x.paidMeal } : x
+    );
+    await updateEvents(key, list);
+    flash(ev.paidMeal ? "Lunch set back to unpaid" : "Lunch is on the shop — 30 min added");
+  };
+
+  const deleteEvent = async (ev) => {
+    const key = ym(new Date(ev.ts));
+    const list = (months[key] || []).filter((x) => x.id !== ev.id);
+    await updateEvents(key, list);
+    flash("Punch deleted");
+  };
+
+  return (
+    <div className="pane">
+      <div className="weekNav">
+        <button className="btn ghost" onClick={() => setWeekOffset((w) => w - 1)}>
+          ‹ Previous
+        </button>
+        <div className="weekLabel">
+          <strong>
+            {weekStartDate.toLocaleDateString(undefined, { month: "short", day: "numeric" })} –{" "}
+            {weekEndDate.toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+          </strong>
+          <span>{weekOffset === 0 ? "This week" : `${Math.abs(weekOffset)} week(s) back`}</span>
+        </div>
+        <button
+          className="btn ghost"
+          onClick={() => setWeekOffset((w) => Math.min(0, w + 1))}
+          disabled={weekOffset >= 0}
+        >
+          Next ›
+        </button>
+        <button className="btn primary" onClick={buildCsv}>
+          Export for payroll
+        </button>
+      </div>
+
+      <div className="viewToggle">
+        <button
+          className={`mgrTab ${view === "hours" ? "on" : ""}`}
+          onClick={() => setView("hours")}
+        >
+          Hours worked
+        </button>
+        <button
+          className={`mgrTab ${view === "variance" ? "on" : ""}`}
+          onClick={() => setView("variance")}
+        >
+          Against the schedule
+        </button>
+      </div>
+
+      {employees.length === 0 ? (
+        <p className="muted pad">Add people to the roster and their hours will show up here.</p>
+      ) : view === "variance" ? (
+        !sched || !sched.shifts || Object.keys(sched.shifts).length === 0 ? (
+          <div className="schedEmpty">
+            <p>No schedule built for this week.</p>
+            <span>Build one in the Schedule tab and the comparison shows up here.</span>
+          </div>
+        ) : (
+          <>
+            <div className="tableWrap">
+              <table className="tc">
+                <thead>
+                  <tr>
+                    <th className="stick">Name</th>
+                    {days.map((d) => (
+                      <th key={d.toISOString()}>{fmtDateShort(d)}</th>
+                    ))}
+                    <th>Sched</th>
+                    <th>Worked</th>
+                    <th>Diff</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr key={r.emp.id}>
+                      <td className="stick nameCell">{r.emp.name}</td>
+                      {r.variance.map((v) => (
+                        <td key={v.day} className={`varCell ${v.kind || ""}`}>
+                          {v.schedH === 0 && v.actualH === 0 ? (
+                            <span className="zero">—</span>
+                          ) : (
+                            <>
+                              <span className="varNum">
+                                {v.diff > 0 ? "+" : ""}
+                                {v.diff.toFixed(2)}
+                              </span>
+                              <em>
+                                {v.schedH.toFixed(1)}→{v.actualH.toFixed(1)}
+                              </em>
+                            </>
+                          )}
+                        </td>
+                      ))}
+                      <td className="num">{r.schedTotal.toFixed(2)}</td>
+                      <td className="num">{r.totals.total.toFixed(2)}</td>
+                      <td className={`num tot ${r.varTotal > 0 ? "ot" : ""}`}>
+                        {r.varTotal > 0 ? "+" : ""}
+                        {r.varTotal.toFixed(2)}
+                      </td>
+                      <td>
+                        <button className="btn tiny" onClick={() => setVarDetail(r)}>
+                          Why
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {(() => {
+              const s = rows.reduce((a, r) => a + r.schedTotal, 0);
+              const w = rows.reduce((a, r) => a + r.totals.total, 0);
+              const d = w - s;
+              const cost = rows.reduce((a, r) => {
+                const rate = parseFloat(r.emp.rate);
+                return a + (isFinite(rate) ? r.varTotal * rate : 0);
+              }, 0);
+              return (
+                <p className={`varSummary ${d > 0 ? "over" : d < 0 ? "under" : ""}`}>
+                  Planned {s.toFixed(1)} hours, paid for {w.toFixed(1)}.{" "}
+                  {Math.abs(d) < 0.05
+                    ? "Right on plan."
+                    : d > 0
+                    ? `You're ${d.toFixed(1)} hours over${
+                        cost > 0 ? `, roughly $${Math.abs(cost).toFixed(0)} at base rates` : ""
+                      }.`
+                    : `You're ${Math.abs(d).toFixed(1)} hours under plan.`}
+                </p>
+              );
+            })()}
+          </>
+        )
+      ) : (
+        <div className="tableWrap">
+          <table className="tc">
+            <thead>
+              <tr>
+                <th className="stick">Name</th>
+                {days.map((d) => (
+                  <th key={d.toISOString()}>{fmtDateShort(d)}</th>
+                ))}
+                <th>Reg</th>
+                <th>OT</th>
+                <th>2x</th>
+                <th>Total</th>
+                <th>Premium</th>
+                <th>Signed</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.emp.id}>
+                  <td className="stick nameCell">
+                    {r.emp.name}
+                    {r.anomalies > 0 && <span className="warnDot" title="Missing clock-out" />}
+                  </td>
+                  {r.dayHours.map((h, i) => (
+                    <td key={i} className={h > 8 ? "hot" : h > 0 ? "" : "zero"}>
+                      {h > 0 ? h.toFixed(2) : "—"}
+                    </td>
+                  ))}
+                  <td className="num">{r.totals.reg.toFixed(2)}</td>
+                  <td className="num ot">{r.totals.ot > 0 ? r.totals.ot.toFixed(2) : "—"}</td>
+                  <td className="num ot">{r.totals.dt > 0 ? r.totals.dt.toFixed(2) : "—"}</td>
+                  <td className="num tot">{r.totals.total.toFixed(2)}</td>
+                  <td>
+                    {r.mealPrem + r.restPrem > 0 ? (
+                      <button className="sigTag bad" onClick={() => setBreakDetail(r)}>
+                        {r.mealPrem + r.restPrem} hr
+                      </button>
+                    ) : r.flags.length > 0 ? (
+                      <button className="sigTag warnEdit" onClick={() => setBreakDetail(r)}>
+                        Waived
+                      </button>
+                    ) : (
+                      <span className="sigTag none">—</span>
+                    )}
+                  </td>
+                  <td>
+                    {(() => {
+                      const a = attest[r.emp.id];
+                      if (!a) return <span className="sigTag none">Not yet</span>;
+                      if (!a.agreed)
+                        return (
+                          <button className="sigTag bad" onClick={() => setViewSign(a)}>
+                            Disputed
+                          </button>
+                        );
+                      const drift =
+                        Math.abs((a.totals?.total || 0) - r.totals.total) > 0.01;
+                      return (
+                        <button
+                          className={`sigTag ${drift ? "warnEdit" : "ok"}`}
+                          onClick={() => setViewSign(a)}
+                        >
+                          {drift ? "Signed, changed" : "Signed"}
+                        </button>
+                      );
+                    })()}
+                  </td>
+                  <td>
+                    <button
+                      className="btn tiny"
+                      onClick={() => setOpenEmp(openEmp === r.emp.id ? null : r.emp.id)}
+                    >
+                      {openEmp === r.emp.id ? "Hide" : "Punches"}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {cfg.mealPay !== "unpaid" &&
+        (() => {
+          const count = rows.reduce((a, r) => a + r.paidMealCount, 0);
+          if (!count) return null;
+          const hrs = rows.reduce((a, r) => a + r.paidMealMs, 0) / 3600000;
+          const cost = rows.reduce((a, r) => {
+            const rate = parseFloat(r.emp.rate);
+            return a + (isFinite(rate) ? (r.paidMealMs / 3600000) * rate : 0);
+          }, 0);
+          return (
+            <p className="paidSummary">
+              You covered {count} lunch{count === 1 ? "" : "es"} this week — {hrs.toFixed(1)} paid
+              hours
+              {cost > 0 ? `, about $${cost.toFixed(0)} at their base rates` : ""}.
+            </p>
+          );
+        })()}
+
+      {openEmp && (
+        <PunchList
+          emp={employees.find((e) => e.id === openEmp)}
+          events={Object.values(months)
+            .flat()
+            .filter((e) => e.empId === openEmp && e.ts >= wStart && e.ts < wEnd)
+            .sort((a, b) => a.ts - b.ts)}
+          onEdit={(ev) => setEditing(ev)}
+          onDelete={deleteEvent}
+          onTogglePaid={togglePaidMeal}
+          cfg={cfg}
+          onAdd={() => setEditing({ empId: openEmp, type: "in", ts: Date.now(), isNew: true })}
+        />
+      )}
+
+      <p className="legalNote">
+        Overtime is figured on California rules: over 8 hours in a day at 1.5×, over 12 at 2×, and
+        over 40 straight-time hours in a week at 1.5×. The seventh consecutive workday premium isn't
+        calculated here — check those weeks by hand before you run payroll.
+      </p>
+
+      {editing && (
+        <PunchEditor
+          ev={editing}
+          months={months}
+          updateEvents={updateEvents}
+          onClose={() => setEditing(null)}
+          flash={flash}
+        />
+      )}
+
+      {varDetail && (
+        <VarianceModal row={varDetail} cfg={cfg} onClose={() => setVarDetail(null)} />
+      )}
+
+      {breakDetail && (
+        <BreakDetailModal row={breakDetail} onClose={() => setBreakDetail(null)} />
+      )}
+
+      {viewSign && (
+        <SignatureModal rec={viewSign} cfg={cfg} onClose={() => setViewSign(null)} />
+      )}
+
+      {csv != null && <CsvModal csv={csv} onClose={() => setCsv(null)} />}
+    </div>
+  );
+}
+
+function PunchList({ emp, events, onEdit, onDelete, onAdd, onTogglePaid, cfg }) {
+  const label = {
+    in: "Clock in",
+    out: "Clock out",
+    mealStart: "Lunch start",
+    mealEnd: "Lunch end",
+    restStart: "Rest start",
+    restEnd: "Rest end",
+    breakStart: "Lunch start",
+    breakEnd: "Lunch end",
+    breakAttest: "Break answers",
+  };
+  const [photos, setPhotos] = useState({});
+  const [zoom, setZoom] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const found = {};
+      for (const ev of events) {
+        if (!ev.photoKey) continue;
+        const data = await sGet(ev.photoKey, null);
+        if (data) found[ev.id] = data;
+      }
+      if (!cancelled) setPhotos(found);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [events]);
+
+  return (
+    <div className="punches">
+      <div className="punchesHead">
+        <h3>{emp?.name} — every punch this week</h3>
+        <button className="btn tiny primary" onClick={onAdd}>
+          Add a punch
+        </button>
+      </div>
+      {events.length === 0 ? (
+        <p className="muted">No punches this week.</p>
+      ) : (
+        <ul className="punchList">
+          {events.map((ev) => (
+            <li key={ev.id}>
+              {photos[ev.id] ? (
+                <button
+                  className="thumbBtn"
+                  onClick={() => setZoom({ src: photos[ev.id], ev })}
+                  aria-label="Enlarge photo"
+                >
+                  <img src={photos[ev.id]} alt="" className="thumb" />
+                </button>
+              ) : (
+                <span className="thumb empty" title={ev.photoKey ? "Photo expired" : "No photo"}>
+                  {ev.photoKey ? "exp" : "—"}
+                </span>
+              )}
+              <span className={`punchType ${ev.type}`}>{label[ev.type]}</span>
+              <span className="punchWhen">
+                {fmtDateShort(new Date(ev.ts))} · {fmtTime(new Date(ev.ts))}
+              </span>
+              {ev.edited && <span className="editedTag">edited</span>}
+              {MEAL_START.includes(ev.type) && cfg?.mealPay === "discretionary" && (
+                <button
+                  className={`payTag ${ev.paidMeal ? "on" : ""}`}
+                  onClick={() => onTogglePaid(ev)}
+                >
+                  {ev.paidMeal ? "Paid lunch — tap to undo" : "Pay this lunch"}
+                </button>
+              )}
+              {MEAL_START.includes(ev.type) && cfg?.mealPay === "always" && (
+                <span className="payTag on static">Paid lunch</span>
+              )}
+              <span className="punchActs">
+                <button className="btn tiny" onClick={() => onEdit(ev)}>
+                  Edit
+                </button>
+                <button className="btn tiny danger" onClick={() => onDelete(ev)}>
+                  Delete
+                </button>
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {zoom && (
+        <div className="overlay" onClick={() => setZoom(null)}>
+          <div className="zoomCard" onClick={(e) => e.stopPropagation()}>
+            <button className="closeX" onClick={() => setZoom(null)} aria-label="Close">
+              ✕
+            </button>
+            <img src={zoom.src} alt="" className="zoomImg" />
+            <p className="zoomMeta">
+              {emp?.name} · {label[zoom.ev.type]} · {fmtDateShort(new Date(zoom.ev.ts))}{" "}
+              {fmtTime(new Date(zoom.ev.ts))}
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PunchEditor({ ev, months, updateEvents, onClose, flash }) {
+  const d = new Date(ev.ts);
+  const [date, setDate] = useState(dayKey(d));
+  const [time, setTime] = useState(fmtTimeInput(d));
+  const [type, setType] = useState(ev.type);
+
+  const save = async () => {
+    const [y, mo, da] = date.split("-").map(Number);
+    const [hh, mm] = time.split(":").map(Number);
+    const ts = new Date(y, mo - 1, da, hh, mm, 0, 0).getTime();
+    const newKey = ym(new Date(ts));
+    const oldKey = ym(new Date(ev.ts));
+
+    if (ev.isNew) {
+      const list = [...(months[newKey] || []), { id: uid(), empId: ev.empId, type, ts, edited: true }];
+      await updateEvents(newKey, list);
+    } else if (newKey === oldKey) {
+      const list = (months[oldKey] || []).map((x) =>
+        x.id === ev.id ? { ...x, ts, type, edited: true } : x
+      );
+      await updateEvents(oldKey, list);
+    } else {
+      await updateEvents(oldKey, (months[oldKey] || []).filter((x) => x.id !== ev.id));
+      await updateEvents(newKey, [...(months[newKey] || []), { ...ev, ts, type, edited: true }]);
+    }
+    flash("Punch saved");
+    onClose();
+  };
+
+  return (
+    <div className="overlay">
+      <div className="editCard">
+        <button className="closeX" onClick={onClose} aria-label="Close">
+          ✕
+        </button>
+        <h2 className="editTitle">{ev.isNew ? "Add a punch" : "Fix a punch"}</h2>
+        <label className="fld">
+          <span>What kind</span>
+          <select value={type} onChange={(e) => setType(e.target.value)}>
+            <option value="in">Clock in</option>
+            <option value="out">Clock out</option>
+            <option value="mealStart">Lunch start</option>
+            <option value="mealEnd">Lunch end</option>
+            <option value="restStart">Rest break start</option>
+            <option value="restEnd">Rest break end</option>
+          </select>
+        </label>
+        <label className="fld">
+          <span>Date</span>
+          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+        </label>
+        <label className="fld">
+          <span>Time</span>
+          <input type="time" value={time} onChange={(e) => setTime(e.target.value)} />
+        </label>
+        <button className="btn primary lg full" onClick={save}>
+          Save punch
+        </button>
+        <p className="setupNote">Edited punches are marked so you can spot them later.</p>
+      </div>
+    </div>
+  );
+}
+
+function VarianceModal({ row, cfg, onClose }) {
+  const days = row.variance.filter((v) => v.schedH > 0 || v.actualH > 0);
+  return (
+    <div className="overlay">
+      <div className="reviewCard">
+        <button className="closeX" onClick={onClose} aria-label="Close">
+          ✕
+        </button>
+        <h2 className="editTitle">{row.emp.name} against the schedule</h2>
+        <div className="sigSummary">
+          <span>
+            Scheduled <strong>{row.schedTotal.toFixed(2)}</strong>
+          </span>
+          <span>
+            Worked <strong>{row.totals.total.toFixed(2)}</strong>
+          </span>
+          <span>
+            Difference{" "}
+            <strong>
+              {row.varTotal > 0 ? "+" : ""}
+              {row.varTotal.toFixed(2)}
+            </strong>
+          </span>
+        </div>
+
+        {days.length === 0 ? (
+          <p className="muted pad">Nothing scheduled or worked this week.</p>
+        ) : (
+          <ul className="varList">
+            {days.map((v) => {
+              const info = row.byDay[v.day];
+              const punches = info
+                ? info.sessions
+                    .map(
+                      (s) =>
+                        `${fmtTime(new Date(s.start))}–${
+                          s.end ? fmtTime(new Date(s.end)) : "open"
+                        }`
+                    )
+                    .join(", ")
+                : "no punches";
+              return (
+                <li key={v.day} className={v.kind || ""}>
+                  <div className="varHead">
+                    <strong>{fmtDateShort(v.date)}</strong>
+                    <span className={v.diff > 0 ? "ot" : ""}>
+                      {v.diff > 0 ? "+" : ""}
+                      {v.diff.toFixed(2)} hrs
+                    </span>
+                  </div>
+                  <div className="varLines">
+                    <p>
+                      <em>Scheduled</em>{" "}
+                      {v.shift
+                        ? `${fmtHHMM(v.shift.start)} – ${fmtHHMM(v.shift.end)} (${v.schedH.toFixed(
+                            1
+                          )} hrs)`
+                        : "not on the schedule"}
+                    </p>
+                    <p>
+                      <em>Actual</em> {punches}
+                      {v.actualH > 0 ? ` (${v.actualH.toFixed(1)} hrs)` : ""}
+                    </p>
+                  </div>
+                  {v.notes.length > 0 && (
+                    <ul className="varNotes">
+                      {v.notes.map((n, i) => (
+                        <li key={i}>{n}</li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        <p className="legalNote">
+          Anything inside {cfg.graceMin} minutes of the scheduled time isn't flagged. Change that
+          slack in Settings. Worth remembering that time on the clock is time you owe regardless of
+          what the schedule said — a tech who clocks in early is still working, so the fix is a
+          conversation, not an edit to their punches.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function BreakDetailModal({ row, onClose }) {
+  const answerText = {
+    waived: "Employee said they chose to skip it",
+    denied: "Employee said they were prevented — premium owed",
+    taken: "Employee said they took it but didn't clock it",
+  };
+  return (
+    <div className="overlay">
+      <div className="reviewCard">
+        <button className="closeX" onClick={onClose} aria-label="Close">
+          ✕
+        </button>
+        <h2 className="editTitle">Break exceptions — {row.emp.name}</h2>
+        <div className="sigSummary">
+          <span>
+            Meal premium <strong>{row.mealPrem} hr</strong>
+          </span>
+          <span>
+            Rest premium <strong>{row.restPrem} hr</strong>
+          </span>
+          <span>
+            Days flagged <strong>{row.flags.length}</strong>
+          </span>
+        </div>
+
+        {row.flags.length === 0 ? (
+          <p className="muted pad">Nothing flagged this week.</p>
+        ) : (
+          <ul className="flagList">
+            {row.flags.map((f) => (
+              <li key={f.day}>
+                <div className="flagHead">
+                  <strong>{fmtDateShort(f.date)}</strong>
+                  <span>{f.comp.hours.toFixed(2)} hrs worked</span>
+                </div>
+                <ul className="flagIssues">
+                  {f.comp.issues.map((i, n) => (
+                    <li key={n}>{i}</li>
+                  ))}
+                </ul>
+                {f.att ? (
+                  <div className="flagAnswer">
+                    {f.att.meal1 && <p>Lunch: {answerText[f.att.meal1]}</p>}
+                    {f.att.rest && <p>Rest: {answerText[f.att.rest]}</p>}
+                    {f.att.note && <p className="flagNote">“{f.att.note}”</p>}
+                  </div>
+                ) : (
+                  <p className="flagAnswer missing">
+                    No answer recorded — ask them what happened and note it before payroll.
+                  </p>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <p className="legalNote">
+          A premium is one hour at the employee's regular rate of pay, and it isn't hours worked — it
+          doesn't feed overtime. California caps it at one meal premium and one rest premium per day,
+          which is how these totals are figured.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function SignatureModal({ rec, onClose }) {
+  const [img, setImg] = useState(null);
+  useEffect(() => {
+    let dead = false;
+    (async () => {
+      if (!rec.signatureKey) return;
+      const d = await sGet(rec.signatureKey, null);
+      if (!dead) setImg(d);
+    })();
+    return () => {
+      dead = true;
+    };
+  }, [rec]);
+
+  return (
+    <div className="overlay">
+      <div className="editCard">
+        <button className="closeX" onClick={onClose} aria-label="Close">
+          ✕
+        </button>
+        <h2 className="editTitle">
+          {rec.agreed ? "Signed timecard" : "Disputed timecard"}
+        </h2>
+        <p className="muted">
+          {rec.empName} · {rec.periodStart} to {rec.periodEnd} · submitted{" "}
+          {fmtDateShort(new Date(rec.signedAt))} {fmtTime(new Date(rec.signedAt))}
+        </p>
+
+        <div className="sigSummary">
+          <span>
+            Regular <strong>{rec.totals.reg.toFixed(2)}</strong>
+          </span>
+          <span>
+            OT <strong>{rec.totals.ot.toFixed(2)}</strong>
+          </span>
+          <span>
+            2x <strong>{rec.totals.dt.toFixed(2)}</strong>
+          </span>
+          <span>
+            Total <strong>{rec.totals.total.toFixed(2)}</strong>
+          </span>
+        </div>
+
+        {rec.agreed ? (
+          img ? (
+            <img src={img} alt="Employee signature" className="sigImg" />
+          ) : (
+            <p className="muted">Signature image not found.</p>
+          )
+        ) : (
+          <div className="disputeShow">
+            <p className="disputeLabel">What they reported</p>
+            <p className="disputeText">{rec.note}</p>
+          </div>
+        )}
+
+        <p className="legalNote">
+          These are the hours as they stood when it was submitted. If you edit punches afterward, the
+          timecard flags it as changed so you can get a fresh sign-off.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function CsvModal({ csv, onClose }) {
+  const taRef = useRef(null);
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(csv);
+      setCopied(true);
+    } catch {
+      if (taRef.current) {
+        taRef.current.select();
+        try {
+          document.execCommand("copy");
+          setCopied(true);
+        } catch {
+          setCopied(false);
+        }
+      }
+    }
+  };
+  return (
+    <div className="overlay">
+      <div className="csvCard">
+        <button className="closeX" onClick={onClose} aria-label="Close">
+          ✕
+        </button>
+        <h2 className="editTitle">Payroll export</h2>
+        <p className="muted">
+          Copy this and paste it into a spreadsheet. Columns are ready for hours, OT, and double
+          time.
+        </p>
+        <textarea ref={taRef} className="csvBox" readOnly value={csv} />
+        <button className="btn primary lg full" onClick={copy}>
+          {copied ? "Copied" : "Copy to clipboard"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- roster ---------- */
+function Roster({ employees, saveEmployees, flash, cfg }) {
+  const [draft, setDraft] = useState(null);
+  const blank = { id: "", name: "", role: "", pin: "", rate: "", active: true };
+
+  const save = async () => {
+    if (!draft.name.trim()) return flash("Name can't be blank", "out");
+    if (!/^\d{4}$/.test(draft.pin)) return flash("PIN must be 4 digits", "out");
+    const clash = employees.find((e) => e.pin === draft.pin && e.id !== draft.id);
+    if (clash) return flash(`${clash.name} already uses that PIN`, "out");
+    let next;
+    if (draft.id) next = employees.map((e) => (e.id === draft.id ? draft : e));
+    else next = [...employees, { ...draft, id: uid() }];
+    await saveEmployees(next);
+    setDraft(null);
+    flash("Roster saved");
+  };
+
+  const toggle = async (emp) => {
+    await saveEmployees(
+      employees.map((e) => (e.id === emp.id ? { ...e, active: e.active === false } : e))
+    );
+  };
+
+  return (
+    <div className="pane">
+      <div className="rosterHead">
+        <h2 className="paneTitle">Who works here</h2>
+        <button className="btn primary" onClick={() => setDraft({ ...blank })}>
+          Add someone
+        </button>
+      </div>
+
+      {employees.length === 0 ? (
+        <p className="muted pad">Nobody yet. Add your first technician.</p>
+      ) : (
+        <ul className="rosterList">
+          {employees.map((e) => (
+            <li key={e.id} className={e.active === false ? "off" : ""}>
+              <div className="rosterMain">
+                <strong>{e.name}</strong>
+                <span>{e.role || "Technician"}</span>
+              </div>
+              <div className="rosterMeta">
+                <span className="pinMask">PIN ••••</span>
+                {e.rate ? <span>${e.rate}/hr</span> : null}
+              </div>
+              <div className="rosterActs">
+                <button className="btn tiny" onClick={() => setDraft({ ...e })}>
+                  Edit
+                </button>
+                <button className="btn tiny" onClick={() => toggle(e)}>
+                  {e.active === false ? "Bring back" : "Set inactive"}
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {draft && (
+        <div className="overlay">
+          <div className="editCard">
+            <button className="closeX" onClick={() => setDraft(null)} aria-label="Close">
+              ✕
+            </button>
+            <h2 className="editTitle">{draft.id ? "Edit person" : "Add someone"}</h2>
+            <label className="fld">
+              <span>Name</span>
+              <input
+                value={draft.name}
+                onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+                placeholder="First and last"
+              />
+            </label>
+            <label className="fld">
+              <span>Job</span>
+              <input
+                value={draft.role}
+                onChange={(e) => setDraft({ ...draft, role: e.target.value })}
+                placeholder="Lube tech, brake tech, service writer…"
+              />
+            </label>
+            <div className="fldRow">
+              <label className="fld">
+                <span>PIN</span>
+                <input
+                  value={draft.pin}
+                  inputMode="numeric"
+                  onChange={(e) =>
+                    setDraft({ ...draft, pin: e.target.value.replace(/\D/g, "").slice(0, 4) })
+                  }
+                  placeholder="4 digits"
+                />
+              </label>
+              <label className="fld">
+                <span>Hourly rate (optional)</span>
+                <input
+                  value={draft.rate}
+                  inputMode="decimal"
+                  onChange={(e) => setDraft({ ...draft, rate: e.target.value })}
+                  placeholder="24.00"
+                />
+              </label>
+            </div>
+            <button className="btn primary lg full" onClick={save}>
+              Save
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- settings ---------- */
+function Settings({ cfg, saveCfg, flash }) {
+  const [d, setD] = useState(cfg);
+  const [pin, setPin] = useState("");
+  const set = (k, v) => setD({ ...d, [k]: v });
+  const save = async () => {
+    const next = { ...d };
+    if (pin) {
+      if (!/^\d{4}$/.test(pin)) return flash("Manager PIN must be 4 digits", "out");
+      next.managerPin = pin;
+    }
+    await saveCfg(next);
+    setPin("");
+    flash("Settings saved");
+  };
+  const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  return (
+    <div className="pane">
+      <h2 className="paneTitle">Settings</h2>
+      <div className="settingsGrid">
+        <label className="fld">
+          <span>Shop name</span>
+          <input value={d.shopName} onChange={(e) => set("shopName", e.target.value)} />
+        </label>
+        <label className="fld">
+          <span>Pay week starts</span>
+          <select value={d.weekStart} onChange={(e) => set("weekStart", Number(e.target.value))}>
+            {dayNames.map((n, i) => (
+              <option key={n} value={i}>
+                {n}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="fld">
+          <span>Round punches to</span>
+          <select value={d.roundingMin} onChange={(e) => set("roundingMin", Number(e.target.value))}>
+            <option value={0}>Exact minute</option>
+            <option value={5}>Nearest 5 minutes</option>
+            <option value={6}>Nearest 6 minutes (tenth of an hour)</option>
+            <option value={15}>Nearest 15 minutes</option>
+          </select>
+        </label>
+        <label className="fld">
+          <span>Overtime rules</span>
+          <select value={d.otRules} onChange={(e) => set("otRules", e.target.value)}>
+            <option value="ca">California (daily and weekly)</option>
+            <option value="flsa">Federal only (over 40 in a week)</option>
+          </select>
+        </label>
+        <label className="fld">
+          <span>California meal and rest tracking</span>
+          <select
+            value={d.breakRules ? "on" : "off"}
+            onChange={(e) => set("breakRules", e.target.value === "on")}
+          >
+            <option value="on">On — track 30-min lunches and 10-min rest breaks</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        {d.breakRules && (
+          <label className="fld">
+            <span>Warn the floor before a lunch deadline</span>
+            <select
+              value={d.breakReminderMin}
+              onChange={(e) => set("breakReminderMin", Number(e.target.value))}
+            >
+              <option value={10}>10 minutes ahead</option>
+              <option value={20}>20 minutes ahead</option>
+              <option value={30}>30 minutes ahead</option>
+              <option value={45}>45 minutes ahead</option>
+            </select>
+          </label>
+        )}
+        <div className="fldRow">
+          <label className="fld">
+            <span>Opens at</span>
+            <select value={d.openHour} onChange={(e) => set("openHour", Number(e.target.value))}>
+              {Array.from({ length: 13 }, (_, i) => i + 4).map((h) => (
+                <option key={h} value={h}>
+                  {h % 12 || 12}:00 {h >= 12 ? "PM" : "AM"}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="fld">
+            <span>Closes at</span>
+            <select value={d.closeHour} onChange={(e) => set("closeHour", Number(e.target.value))}>
+              {Array.from({ length: 12 }, (_, i) => i + 12).map((h) => (
+                <option key={h} value={h}>
+                  {h % 12 || 12}:00 {h >= 12 ? "PM" : "AM"}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <label className="fld">
+          <span>Photo at every punch</span>
+          <select
+            value={d.photos ? "on" : "off"}
+            onChange={(e) => set("photos", e.target.value === "on")}
+          >
+            <option value="on">On — front camera snaps a photo</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        {d.photos && (
+          <div className="fldRow">
+            <label className="fld">
+              <span>If the camera fails</span>
+              <select
+                value={d.photoRequired ? "block" : "allow"}
+                onChange={(e) => set("photoRequired", e.target.value === "block")}
+              >
+                <option value="allow">Let the punch through</option>
+                <option value="block">Block the punch</option>
+              </select>
+            </label>
+            <label className="fld">
+              <span>Keep photos for</span>
+              <select
+                value={d.photoRetentionDays}
+                onChange={(e) => set("photoRetentionDays", Number(e.target.value))}
+              >
+                <option value={14}>14 days</option>
+                <option value={30}>30 days</option>
+                <option value={45}>45 days</option>
+                <option value={90}>90 days</option>
+              </select>
+            </label>
+          </div>
+        )}
+        <label className="fld">
+          <span>Sign off on hours at the end of the pay period</span>
+          <select
+            value={d.attestation ? "on" : "off"}
+            onChange={(e) => set("attestation", e.target.value === "on")}
+          >
+            <option value="on">On — review and sign at the last clock-out</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        {d.breakRules && (
+          <>
+            <label className="fld">
+              <span>Paying for the 30-minute lunch</span>
+              <select value={d.mealPay} onChange={(e) => set("mealPay", e.target.value)}>
+                <option value="unpaid">Never — lunch is always unpaid</option>
+                <option value="discretionary">When I say so — I mark individual lunches paid</option>
+                <option value="always">Always — every lunch is paid</option>
+              </select>
+            </label>
+
+            {d.mealPay === "discretionary" && (
+              <div className="noteBox">
+                Lunches start out unpaid. To gift one, open Timecards, hit Punches next to the tech,
+                and tap Pay this lunch on that day. It adds the 30 minutes back to their hours right
+                away. The break itself doesn't change — they're still off duty and free to leave, so
+                nothing about compliance shifts.
+              </div>
+            )}
+            {d.mealPay === "always" && (
+              <div className="noteBox">
+                Every lunch becomes hours worked. A tech clocked 8:00 to 5:00 lands at 9 hours
+                instead of 8.5, so an hour of daily overtime shows up where a half hour did before.
+                Figure about 2.5 paid hours a week per tech, some of it at time and a half.
+              </div>
+            )}
+          </>
+        )}
+
+        <label className="fld">
+          <span>Fewest people on the floor at once</span>
+          <select value={d.minStaff} onChange={(e) => set("minStaff", Number(e.target.value))}>
+            {[1, 2, 3, 4].map((n) => (
+              <option key={n} value={n}>
+                {n} {n === 1 ? "person" : "people"}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="fld">
+          <span>Slack before a punch counts as late or early</span>
+          <select value={d.graceMin} onChange={(e) => set("graceMin", Number(e.target.value))}>
+            {[0, 3, 6, 10, 15].map((n) => (
+              <option key={n} value={n}>
+                {n === 0 ? "Exact — flag any difference" : `${n} minutes`}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="fld">
+          <span>New manager PIN (leave blank to keep the current one)</span>
+          <input
+            value={pin}
+            inputMode="numeric"
+            onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 4))}
+            placeholder="4 digits"
+          />
+        </label>
+      </div>
+      <button className="btn primary lg" onClick={save}>
+        Save settings
+      </button>
+      <p className="legalNote">
+        Rounding applies to how hours are totaled. The exact punch time is always kept underneath, so
+        you can turn rounding off and the real numbers come back.
+      </p>
+      <p className="legalNote">
+        Punch photos are small stills stored on this iPad only — nothing is uploaded anywhere. The
+        camera preview stays visible while someone punches so nobody is recorded without seeing it.
+        Photos delete themselves after the window you set above. California treats a face image as
+        biometric-adjacent personal information, so tell your crew in writing that the clock takes a
+        photo and why, and keep that notice with your handbook.
+      </p>
+    </div>
+  );
+}
+
+/* ---------- styles ---------- */
+function Styles() {
+  return (
+    <style>{`
+:root {
+  --asphalt:#12161c;
+  --panel:#1a2029;
+  --panel2:#212934;
+  --line:#2e3743;
+  --ink:#e9eef4;
+  --muted:#8b98a8;
+  --signal:#f2a310;
+  --live:#3fb56a;
+  --brk:#5aa7e0;
+  --warn:#e2593f;
+}
+* { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+.root {
+  min-height:100vh;
+  background:var(--asphalt);
+  color:var(--ink);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  font-variant-numeric:tabular-nums;
+  display:flex; flex-direction:column;
+  padding:0;
+}
+button { font-family:inherit; cursor:pointer; }
+input, select, textarea { font-family:inherit; font-size:17px; }
+
+/* top bar */
+.bar {
+  display:flex; align-items:flex-end; justify-content:space-between;
+  padding:22px 28px 18px;
+  border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,#171d25,#12161c);
+}
+.shopName { margin:0; font-size:26px; font-weight:650; letter-spacing:-0.02em; }
+.barDate { margin:4px 0 0; color:var(--muted); font-size:15px; }
+.barRight { text-align:right; }
+.bigClock {
+  font-size:52px; font-weight:300; letter-spacing:-0.03em; line-height:1;
+  font-variant-numeric:tabular-nums;
+}
+.onNow { margin-top:6px; font-size:14px; color:var(--signal); }
+
+/* grid */
+.grid {
+  flex:1;
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
+  gap:16px;
+  padding:24px 28px;
+  align-content:start;
+}
+.tile {
+  position:relative;
+  text-align:left;
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:14px;
+  padding:20px 20px 16px;
+  color:inherit;
+  display:flex; flex-direction:column; gap:14px;
+  min-height:172px;
+  transition:transform .08s ease, background .15s ease;
+}
+.tile:active { transform:scale(.985); background:var(--panel2); }
+.tileRule {
+  position:absolute; top:0; left:16px; right:16px; height:3px;
+  background:var(--line); border-radius:0 0 3px 3px;
+}
+.tile.in .tileRule { background:var(--live); }
+.tile.break .tileRule { background:var(--brk); }
+.tileTop { display:flex; flex-direction:column; gap:3px; }
+.tileName { font-size:22px; font-weight:600; letter-spacing:-0.01em; }
+.tileRole { font-size:14px; color:var(--muted); }
+.tileBottom { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.tileHrs { font-size:14px; color:var(--muted); }
+.pill {
+  font-size:13px; padding:5px 11px; border-radius:999px;
+  border:1px solid var(--line); color:var(--muted);
+}
+.pill.in { color:var(--live); border-color:rgba(63,181,106,.4); background:rgba(63,181,106,.08); }
+.pill.break { color:var(--brk); border-color:rgba(90,167,224,.4); background:rgba(90,167,224,.08); }
+
+/* day bar */
+.daybar { position:relative; display:block; height:22px; }
+.daybarTrack {
+  position:absolute; top:6px; left:0; right:0; height:6px;
+  background:#161c24; border:1px solid var(--line); border-radius:3px;
+}
+.daybarSeg { position:absolute; top:7px; height:4px; border-radius:2px; }
+.daybarSeg.work { background:var(--live); }
+.daybarSeg.meal { background:var(--signal); }
+.daybarSeg.rest { background:var(--brk); }
+.daybarSeg.brk { background:var(--brk); }
+.daybarNow { position:absolute; top:2px; width:1px; height:14px; background:var(--signal); }
+.daybarEnds {
+  position:absolute; top:16px; left:0; right:0;
+  display:flex; justify-content:space-between;
+  font-size:10px; color:#5c6774; font-style:normal;
+}
+.daybarEnds em { font-style:normal; }
+
+/* footer */
+.foot {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:14px 28px 20px; border-top:1px solid var(--line);
+}
+.footNote { color:#59636f; font-size:14px; }
+.linkBtn {
+  background:none; border:1px solid var(--line); color:var(--muted);
+  padding:10px 18px; border-radius:9px; font-size:15px;
+}
+.linkBtn:active { background:var(--panel); }
+
+/* empty */
+.empty { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:40px; text-align:center; }
+.empty h2 { margin:0; font-size:26px; font-weight:600; }
+.empty p { margin:0; color:var(--muted); max-width:46ch; line-height:1.5; }
+
+/* buttons */
+.btn {
+  border-radius:10px; border:1px solid var(--line);
+  background:var(--panel); color:var(--ink);
+  padding:11px 18px; font-size:15px;
+}
+.btn:active { background:var(--panel2); }
+.btn.primary { background:var(--signal); border-color:var(--signal); color:#1a1300; font-weight:600; }
+.btn.ghost { background:transparent; color:var(--muted); }
+.btn.tiny { padding:7px 12px; font-size:13px; }
+.btn.tiny.primary { color:#1a1300; }
+.btn.danger { color:var(--warn); border-color:rgba(226,89,63,.35); }
+.btn.lg { padding:16px 26px; font-size:18px; }
+.btn.full { width:100%; margin-top:8px; }
+.btn:disabled { opacity:.35; }
+
+/* overlay + keypad */
+.overlay {
+  position:fixed; inset:0; background:rgba(8,11,15,.86);
+  display:flex; align-items:center; justify-content:center; padding:20px; z-index:50;
+  backdrop-filter:blur(3px);
+}
+.pinCard, .actCard, .editCard, .csvCard {
+  position:relative;
+  background:var(--panel); border:1px solid var(--line); border-radius:18px;
+  padding:30px; width:100%; max-width:420px;
+}
+.csvCard { max-width:680px; }
+.editCard { max-width:520px; }
+.closeX {
+  position:absolute; top:14px; right:14px; width:40px; height:40px;
+  border-radius:10px; border:1px solid var(--line); background:transparent;
+  color:var(--muted); font-size:16px;
+}
+.pinName { margin:0; font-size:26px; text-align:center; font-weight:600; }
+.pinSub { margin:6px 0 0; text-align:center; color:var(--muted); font-size:15px; }
+.dots { display:flex; gap:14px; justify-content:center; margin:22px 0 6px; }
+.dot { width:15px; height:15px; border-radius:50%; border:1.5px solid #3d4854; }
+.dot.on { background:var(--signal); border-color:var(--signal); }
+.shake { animation:shake .3s; }
+@keyframes shake { 0%,100%{transform:translateX(0)} 25%{transform:translateX(-7px)} 75%{transform:translateX(7px)} }
+.pinErr { color:var(--warn); text-align:center; font-size:14px; margin:6px 0 0; min-height:20px; }
+.pinErrHold { min-height:20px; margin:6px 0 0; }
+.keys { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:18px; }
+.key {
+  height:72px; font-size:26px; font-weight:400;
+  background:var(--panel2); border:1px solid var(--line); color:var(--ink); border-radius:12px;
+}
+.key:active { background:#2b3542; }
+.keyDel { font-size:22px; color:var(--muted); }
+
+/* action sheet */
+.actName { margin:0; text-align:center; font-size:28px; font-weight:600; }
+.actMeta { margin:8px 0 22px; text-align:center; color:var(--muted); font-size:15px; }
+.actBtns { display:flex; flex-direction:column; gap:12px; }
+.bigAct {
+  height:76px; border-radius:14px; font-size:21px; font-weight:600;
+  border:1px solid var(--line); background:var(--panel2); color:var(--ink);
+}
+.bigAct.in { background:var(--live); border-color:var(--live); color:#04180c; }
+.bigAct.out { background:var(--signal); border-color:var(--signal); color:#1a1300; }
+.bigAct.brk { background:transparent; color:var(--brk); border-color:rgba(90,167,224,.4); }
+
+/* camera */
+.cam {
+  position:relative; margin:0 auto 18px; overflow:hidden;
+  background:#0d1116; border:1px solid var(--line); border-radius:14px;
+  display:flex; align-items:center; justify-content:center;
+}
+.cam.sm { width:150px; height:112px; }
+.cam.lg { width:230px; height:172px; }
+.cam.live { border-color:rgba(63,181,106,.45); }
+.camVid { width:100%; height:100%; object-fit:cover; transform:scaleX(-1); display:block; }
+.cam:not(.live) .camVid { opacity:0; }
+.camFallback {
+  position:absolute; inset:0; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:8px; padding:12px;
+  text-align:center; color:var(--muted); font-size:12px; line-height:1.4;
+}
+.camIcon { font-size:20px; color:#3d4854; }
+.camDot {
+  position:absolute; top:9px; right:9px; width:9px; height:9px; border-radius:50%;
+  background:var(--live); box-shadow:0 0 0 3px rgba(63,181,106,.2);
+}
+.camNote { margin:16px 0 0; text-align:center; font-size:13px; color:var(--muted); }
+
+.noteBox {
+  padding:14px 16px; margin:0 0 16px; border-radius:10px; font-size:13.5px; line-height:1.55;
+  background:var(--asphalt); border:1px solid var(--line); color:var(--muted);
+}
+.noteBox.warn {
+  background:rgba(226,89,63,.09); border-color:rgba(226,89,63,.35); color:#f0a08d;
+}
+.payTag {
+  font-size:12px; padding:5px 11px; border-radius:999px; white-space:nowrap;
+  border:1px dashed var(--line); background:transparent; color:var(--muted);
+}
+.payTag.on { border-style:solid; border-color:rgba(63,181,106,.45); color:var(--live); background:rgba(63,181,106,.08); }
+.payTag.static { cursor:default; }
+.paidSummary {
+  margin:16px 0 0; padding:13px 16px; border-radius:10px; font-size:14px; line-height:1.5;
+  background:rgba(63,181,106,.07); border:1px solid rgba(63,181,106,.28); color:var(--live);
+}
+
+/* schedule variance */
+.viewToggle { display:flex; gap:6px; margin-bottom:16px; }
+.varCell { padding:9px 8px !important; }
+.varNum { display:block; font-size:15px; font-weight:600; }
+.varCell em { display:block; font-style:normal; font-size:11px; color:#5c6774; margin-top:2px; }
+.varCell.over .varNum { color:var(--signal); }
+.varCell.under .varNum { color:var(--brk); }
+.varCell.noshow { background:rgba(226,89,63,.09); }
+.varCell.noshow .varNum { color:var(--warn); }
+.varCell.unscheduled { background:rgba(242,163,16,.08); }
+.varCell.unscheduled .varNum { color:var(--signal); }
+.varSummary {
+  margin:16px 0 0; padding:14px 16px; border-radius:10px; font-size:14.5px; line-height:1.5;
+  background:var(--panel); border:1px solid var(--line); color:var(--muted);
+}
+.varSummary.over { color:var(--signal); border-color:rgba(242,163,16,.32); background:rgba(242,163,16,.07); }
+.varSummary.under { color:var(--brk); border-color:rgba(90,167,224,.3); background:rgba(90,167,224,.07); }
+.varList { list-style:none; margin:18px 0 0; padding:0; display:flex; flex-direction:column; gap:10px; }
+.varList li { background:var(--asphalt); border:1px solid var(--line); border-radius:11px; padding:14px 16px; }
+.varList li.noshow { border-color:rgba(226,89,63,.35); }
+.varList li.unscheduled { border-color:rgba(242,163,16,.32); }
+.varHead { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px; }
+.varHead strong { font-size:15px; }
+.varHead span { font-size:14px; color:var(--muted); }
+.varHead span.ot { color:var(--signal); }
+.varLines p { margin:0 0 3px; font-size:13.5px; color:var(--muted); }
+.varLines em { font-style:normal; display:inline-block; width:78px; color:#5c6774; }
+.varNotes { margin:9px 0 0; padding-left:18px; font-size:13px; color:var(--signal); line-height:1.6; }
+
+/* schedule */
+.postState {
+  padding:12px 15px; margin-bottom:16px; border-radius:10px;
+  font-size:13.5px; line-height:1.5; color:var(--muted);
+  background:var(--panel); border:1px solid var(--line);
+}
+.postState.live { color:var(--live); border-color:rgba(63,181,106,.3); background:rgba(63,181,106,.07); }
+table.sched th em { display:block; font-style:normal; font-size:11px; color:#5c6774; margin-top:2px; }
+table.sched td.cellPad { padding:6px; }
+.schedCell {
+  width:100%; min-height:56px; border-radius:9px; padding:8px 6px;
+  background:transparent; border:1px dashed var(--line); color:var(--muted);
+  display:flex; flex-direction:column; gap:3px; align-items:center; justify-content:center;
+  font-size:13px;
+}
+.schedCell.on {
+  background:rgba(63,181,106,.09); border:1px solid rgba(63,181,106,.35);
+  color:var(--ink); font-weight:600;
+}
+.schedCell em { font-style:normal; font-size:11px; color:var(--muted); font-weight:400; }
+.addMark { font-size:20px; color:#3d4854; }
+.coverRow td { border-top:2px solid var(--line); font-size:14px; color:var(--muted); }
+.coverRow .stick { font-size:13px; color:var(--muted); font-weight:500; }
+.schedWarn {
+  margin-top:18px; padding:14px 16px; border-radius:10px; font-size:14px; line-height:1.55;
+  background:rgba(242,163,16,.09); border:1px solid rgba(242,163,16,.32); color:var(--signal);
+}
+.schedWarn p { margin:0 0 6px; }
+.schedWarn p:last-child { margin-bottom:0; }
+.schedFoot { margin-top:22px; }
+.presetRow { display:flex; gap:8px; flex-wrap:wrap; margin:14px 0 18px; }
+.shiftPreview {
+  margin:4px 0 16px; padding:12px 14px; border-radius:9px; font-size:14px;
+  background:var(--asphalt); border:1px solid var(--line); color:var(--live);
+}
+.shiftPreview.bad { color:var(--warn); border-color:rgba(226,89,63,.35); }
+.weekNav.tight { margin:4px 0 18px; justify-content:space-between; }
+.weekTag { font-size:14px; color:var(--muted); }
+
+.schedEmpty {
+  padding:34px 20px; text-align:center; border-radius:12px;
+  background:var(--asphalt); border:1px solid var(--line);
+}
+.schedEmpty p { margin:0 0 6px; font-size:17px; }
+.schedEmpty span { font-size:14px; color:var(--muted); }
+.myDays { list-style:none; margin:0; padding:0; }
+.myDays li {
+  display:grid; grid-template-columns:130px 1fr auto; gap:8px 14px; align-items:baseline;
+  padding:15px 14px; border-radius:11px; margin-bottom:8px;
+  background:var(--asphalt); border:1px solid var(--line);
+}
+.myDays li.off { opacity:.5; }
+.myDays li.today { border-color:var(--signal); background:rgba(242,163,16,.07); }
+.myDayName { font-size:16px; font-weight:600; }
+.myDayName em { display:block; font-style:normal; font-size:12.5px; color:var(--muted); font-weight:400; margin-top:2px; }
+.myTimes { font-size:19px; font-weight:600; }
+.myTimes.offTxt { font-size:16px; font-weight:400; color:var(--muted); }
+.myMeta { font-size:13px; color:var(--muted); text-align:right; }
+.myNote { grid-column:1 / -1; font-size:13.5px; color:var(--brk); }
+.todayTag {
+  grid-column:3; font-size:11px; color:var(--signal);
+  border:1px solid rgba(242,163,16,.4); border-radius:999px; padding:3px 9px;
+}
+
+/* break tracking */
+.floorAlert {
+  display:flex; flex-wrap:wrap; gap:10px 24px;
+  padding:14px 28px; background:rgba(242,163,16,.09);
+  border-bottom:1px solid rgba(242,163,16,.3);
+}
+.floorItem { font-size:15px; color:var(--signal); }
+.floorItem strong { color:var(--ink); font-weight:600; }
+.floorItem.over { color:#f0a08d; }
+.tileDue {
+  font-size:12.5px; color:var(--muted); padding-top:2px;
+  border-top:1px solid var(--line); margin-top:-2px;
+}
+.tileDue.soon { color:var(--signal); }
+.tileDue.over { color:#f0a08d; }
+.tileDue.timer { color:var(--brk); }
+.tile.meal .tileRule { background:var(--signal); }
+.tile.rest .tileRule { background:var(--brk); }
+.pill.meal { color:var(--signal); border-color:rgba(242,163,16,.4); background:rgba(242,163,16,.08); }
+.pill.rest { color:var(--brk); border-color:rgba(90,167,224,.4); background:rgba(90,167,224,.08); }
+
+.breakTimer {
+  display:flex; flex-direction:column; align-items:center; gap:4px;
+  padding:16px; margin-bottom:18px; border-radius:12px;
+  background:var(--asphalt); border:1px solid var(--line);
+}
+.breakTimer strong { font-size:38px; font-weight:300; letter-spacing:-0.03em; }
+.breakTimer span { font-size:13px; color:var(--muted); text-align:center; }
+.breakTimer.short strong { color:var(--signal); }
+.breakTimer.done strong { color:var(--live); }
+
+.dueBanner {
+  padding:12px 14px; margin-bottom:16px; border-radius:10px; font-size:14px; line-height:1.45;
+  background:rgba(242,163,16,.1); border:1px solid rgba(242,163,16,.35); color:var(--signal);
+}
+.dueBanner.over { background:rgba(226,89,63,.1); border-color:rgba(226,89,63,.4); color:#f0a08d; }
+
+.bigAct em { display:block; font-style:normal; font-size:12.5px; font-weight:400; opacity:.72; margin-top:3px; }
+.bigAct.meal { background:var(--signal); border-color:var(--signal); color:#1a1300; }
+.bigAct { height:auto; min-height:76px; padding:14px 18px; }
+.shortWarn { display:flex; flex-direction:column; gap:11px; }
+.shortWarn p {
+  margin:0; padding:14px; border-radius:10px; font-size:14px; line-height:1.5;
+  background:rgba(226,89,63,.1); border:1px solid rgba(226,89,63,.35); color:#f0a08d;
+}
+
+.attestBlock { margin-bottom:22px; }
+.attestQ { margin:0 0 12px; font-size:16px; font-weight:600; }
+.attestOpts { display:flex; flex-direction:column; gap:10px; }
+.attestOpt {
+  text-align:left; padding:15px 17px; border-radius:12px;
+  background:var(--asphalt); border:1px solid var(--line); color:var(--ink);
+  display:flex; flex-direction:column; gap:4px;
+}
+.attestOpt strong { font-size:16px; font-weight:600; }
+.attestOpt span { font-size:13.5px; color:var(--muted); line-height:1.45; }
+.attestOpt.on { border-color:var(--signal); background:rgba(242,163,16,.09); }
+.disputeBox.short { min-height:84px; }
+
+.flagList { list-style:none; margin:18px 0 0; padding:0; display:flex; flex-direction:column; gap:12px; }
+.flagList li { background:var(--asphalt); border:1px solid var(--line); border-radius:12px; padding:15px 17px; }
+.flagHead { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px; }
+.flagHead span { font-size:13px; color:var(--muted); }
+.flagIssues { margin:0 0 10px; padding-left:18px; font-size:14px; color:var(--signal); line-height:1.6; }
+.flagAnswer { font-size:14px; color:var(--muted); line-height:1.55; }
+.flagAnswer p { margin:0 0 4px; }
+.flagAnswer.missing { color:#f0a08d; }
+.flagNote { font-style:italic; color:var(--ink); margin-top:6px !important; }
+
+/* end-of-period review */
+.reviewCard {
+  position:relative; background:var(--panel); border:1px solid var(--line);
+  border-radius:18px; padding:28px; width:100%; max-width:620px;
+  max-height:92vh; overflow-y:auto;
+}
+.reviewHead { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; margin-bottom:20px; }
+.reviewTitle { margin:0; font-size:25px; font-weight:600; letter-spacing:-0.02em; }
+.reviewSub { margin:5px 0 0; color:var(--muted); font-size:15px; }
+.reviewTotal { text-align:right; line-height:1.05; }
+.reviewTotal strong { display:block; font-size:38px; font-weight:300; letter-spacing:-0.03em; }
+.reviewTotal span { font-size:13px; color:var(--muted); }
+.reviewDays { list-style:none; margin:0 0 16px; padding:0; border-top:1px solid var(--line); }
+.reviewDays li {
+  display:grid; grid-template-columns:88px 1fr auto 62px; gap:10px; align-items:center;
+  padding:11px 2px; border-bottom:1px solid var(--line); font-size:15px;
+}
+.reviewDays li.off { color:#4c5663; }
+.rdDay { color:var(--muted); font-size:14px; }
+.rdPunch { font-size:14px; }
+.rdBreak { font-size:12px; color:var(--brk); }
+.rdHrs { text-align:right; font-weight:600; }
+.reviewSplit { display:flex; gap:22px; flex-wrap:wrap; font-size:14px; color:var(--muted); margin-bottom:18px; }
+.reviewSplit strong { color:var(--ink); font-size:16px; margin-left:4px; }
+.reviewWarn {
+  background:rgba(226,89,63,.1); border:1px solid rgba(226,89,63,.35);
+  color:#f0a08d; padding:12px 14px; border-radius:10px; font-size:14px; margin:0 0 16px; line-height:1.5;
+}
+.reviewActs { display:flex; flex-direction:column; gap:11px; }
+.linkBtn.wide { width:100%; margin-top:12px; }
+.signLead { margin:0 0 18px; font-size:16px; line-height:1.55; }
+.signFine { margin:14px 0 0; color:#5c6774; font-size:13px; line-height:1.5; }
+
+/* signature pad */
+.sigWrap { margin-bottom:18px; }
+.sigPad {
+  width:100%; height:170px; display:block; touch-action:none;
+  background:#0d1116; border:1px solid var(--line); border-radius:12px;
+  cursor:crosshair;
+}
+.sigBase { display:flex; align-items:center; justify-content:space-between; margin-top:8px; }
+.sigX { color:#3d4854; font-size:13px; letter-spacing:-0.5px; overflow:hidden; white-space:nowrap; }
+.sigImg { width:100%; border-radius:10px; border:1px solid var(--line); margin:16px 0 0; display:block; }
+.sigSummary {
+  display:flex; gap:18px; flex-wrap:wrap; margin:16px 0 0;
+  padding:14px; background:var(--asphalt); border:1px solid var(--line);
+  border-radius:10px; font-size:13px; color:var(--muted);
+}
+.sigSummary strong { color:var(--ink); font-size:15px; margin-left:5px; }
+.disputeBox {
+  background:var(--asphalt); border:1px solid var(--line); color:var(--ink);
+  border-radius:10px; padding:14px; min-height:130px; width:100%; resize:vertical; line-height:1.5;
+}
+.disputeShow { margin-top:16px; }
+.disputeLabel { margin:0 0 6px; font-size:13px; color:var(--muted); }
+.disputeText {
+  margin:0; padding:14px; background:var(--asphalt); border:1px solid rgba(226,89,63,.3);
+  border-radius:10px; line-height:1.55; font-size:15px;
+}
+.sigTag {
+  font-size:12px; padding:5px 10px; border-radius:999px;
+  border:1px solid var(--line); background:transparent; color:var(--muted); white-space:nowrap;
+}
+.sigTag.ok { color:var(--live); border-color:rgba(63,181,106,.4); }
+.sigTag.bad { color:var(--warn); border-color:rgba(226,89,63,.45); }
+.sigTag.warnEdit { color:var(--signal); border-color:rgba(242,163,16,.45); }
+.sigTag.none { color:#4c5663; }
+
+/* punch photos */
+.thumbBtn { padding:0; border:none; background:none; line-height:0; border-radius:8px; }
+.thumb {
+  width:56px; height:42px; object-fit:cover; border-radius:8px;
+  border:1px solid var(--line); display:block;
+}
+.thumb.empty {
+  display:flex; align-items:center; justify-content:center;
+  color:#4c5663; font-size:11px; background:#0d1116;
+}
+.zoomCard {
+  position:relative; background:var(--panel); border:1px solid var(--line);
+  border-radius:16px; padding:26px; max-width:440px; width:100%;
+}
+.zoomImg { width:100%; border-radius:12px; display:block; }
+.zoomMeta { margin:14px 0 0; text-align:center; color:var(--muted); font-size:14px; }
+
+/* toast */
+.toast {
+  position:fixed; left:50%; bottom:36px; transform:translateX(-50%);
+  background:var(--live); color:#04180c; padding:16px 28px; border-radius:12px;
+  font-size:18px; font-weight:600; z-index:80; box-shadow:0 10px 40px rgba(0,0,0,.5);
+}
+.toast.out { background:var(--signal); color:#1a1300; }
+
+/* setup */
+.setupWrap { flex:1; display:flex; align-items:center; justify-content:center; padding:24px; }
+.setupCard { width:100%; max-width:460px; background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:32px; }
+.setupTitle { margin:0 0 8px; font-size:27px; font-weight:600; letter-spacing:-0.02em; }
+.setupLead { margin:0 0 22px; color:var(--muted); line-height:1.5; font-size:15px; }
+.setupNote { margin:14px 0 0; color:#5c6774; font-size:13px; line-height:1.5; }
+.fld { display:flex; flex-direction:column; gap:7px; margin-bottom:16px; }
+.fld > span { font-size:14px; color:var(--muted); }
+.fld input, .fld select, .fld textarea {
+  background:var(--asphalt); border:1px solid var(--line); color:var(--ink);
+  border-radius:10px; padding:14px 14px; min-height:52px;
+}
+.fld input:focus, .fld select:focus { outline:2px solid var(--signal); outline-offset:1px; }
+.fldRow { display:flex; gap:14px; }
+.fldRow .fld { flex:1; }
+.fldErr { color:var(--warn); font-size:14px; margin:0 0 10px; }
+
+/* manager */
+.mgr { flex:1; display:flex; flex-direction:column; }
+.mgrBar {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:16px 24px; border-bottom:1px solid var(--line); gap:12px;
+}
+.mgrTabs { display:flex; gap:6px; }
+.mgrTab {
+  background:transparent; border:1px solid transparent; color:var(--muted);
+  padding:10px 18px; border-radius:9px; font-size:16px;
+}
+.mgrTab.on { color:var(--ink); border-color:var(--line); background:var(--panel); }
+.pane { padding:22px 24px 40px; }
+.paneTitle { margin:0 0 16px; font-size:21px; font-weight:600; }
+.muted { color:var(--muted); }
+.pad { padding:20px 0; }
+
+/* timecards */
+.weekNav { display:flex; align-items:center; gap:12px; margin-bottom:18px; flex-wrap:wrap; }
+.weekLabel { display:flex; flex-direction:column; gap:2px; min-width:180px; }
+.weekLabel strong { font-size:17px; }
+.weekLabel span { font-size:13px; color:var(--muted); }
+.tableWrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; }
+table.tc { width:100%; border-collapse:collapse; font-size:15px; }
+table.tc th, table.tc td { padding:13px 12px; text-align:center; border-bottom:1px solid var(--line); white-space:nowrap; }
+table.tc th { color:var(--muted); font-weight:500; font-size:13px; background:var(--panel); }
+table.tc td.zero { color:#4c5663; }
+table.tc td.hot { color:var(--signal); }
+table.tc td.num { color:var(--ink); }
+table.tc td.ot { color:var(--signal); }
+table.tc td.tot { font-weight:700; }
+.stick { text-align:left !important; position:sticky; left:0; background:var(--panel); z-index:2; }
+.nameCell { font-weight:600; }
+.warnDot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--warn); margin-left:8px; vertical-align:middle; }
+
+.punches { margin-top:22px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; }
+.punchesHead { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; gap:12px; }
+.punchesHead h3 { margin:0; font-size:16px; font-weight:600; }
+.punchList { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; }
+.punchList li { display:flex; align-items:center; gap:14px; padding:11px 0; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+.punchList li:last-child { border-bottom:none; }
+.punchType { font-size:14px; min-width:110px; }
+.punchType.in, .punchType.mealEnd, .punchType.restEnd, .punchType.breakEnd { color:var(--live); }
+.punchType.out { color:var(--signal); }
+.punchType.breakStart, .punchType.mealStart { color:var(--signal); }
+.punchType.restStart { color:var(--brk); }
+.punchType.breakAttest { color:var(--muted); }
+.punchWhen { font-size:15px; }
+.editedTag { font-size:12px; color:var(--muted); border:1px solid var(--line); padding:2px 8px; border-radius:999px; }
+.punchActs { margin-left:auto; display:flex; gap:8px; }
+.legalNote { margin-top:22px; color:#5c6774; font-size:13px; line-height:1.6; max-width:78ch; }
+
+.csvBox {
+  width:100%; height:260px; margin:12px 0 4px;
+  background:var(--asphalt); border:1px solid var(--line); color:var(--ink);
+  border-radius:10px; padding:12px; font-size:13px; white-space:pre;
+}
+.editTitle { margin:0 0 16px; font-size:22px; font-weight:600; }
+
+/* roster */
+.rosterHead { display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; }
+.rosterList { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:10px; }
+.rosterList li {
+  display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+  background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px;
+}
+.rosterList li.off { opacity:.45; }
+.rosterMain { display:flex; flex-direction:column; gap:2px; min-width:180px; }
+.rosterMain strong { font-size:17px; }
+.rosterMain span { font-size:14px; color:var(--muted); }
+.rosterMeta { display:flex; gap:16px; color:var(--muted); font-size:14px; }
+.rosterActs { margin-left:auto; display:flex; gap:8px; }
+.pinMask { letter-spacing:.1em; }
+
+.settingsGrid { max-width:520px; }
+
+/* boot */
+.bootWrap { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; }
+.bootPulse { width:36px; height:36px; border-radius:50%; border:2px solid var(--line); border-top-color:var(--signal); animation:spin 1s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+.bootTxt { color:var(--muted); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation:none !important; transition:none !important; }
+}
+@media (max-width:700px) {
+  .bar { flex-direction:column; align-items:flex-start; gap:10px; }
+  .barRight { text-align:left; }
+  .grid { padding:16px; }
+}
+`}</style>
+  );
+}
+
+
+const boot = document.getElementById("boot");
+if (boot) boot.remove();
+ReactDOM.createRoot(document.getElementById("root")).render(<TimeClock />);
+</script>
+</body>
+</html>
