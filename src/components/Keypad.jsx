@@ -2,7 +2,10 @@ import { useState, useEffect } from "react";
 import { CameraFeed } from "./CameraFeed.jsx";
 
 /* ---------- shared UI ---------- */
-export function Keypad({ title, subtitle, onSubmit, onCancel, error, length = 4, cam }) {
+/* `inline` renders the pad as page content instead of an overlay (the
+   PIN-only home screen). `onStart` fires on the first digit so the camera
+   can warm up while the rest of the PIN is typed. */
+export function Keypad({ title, subtitle, onSubmit, onCancel, onStart, error, length = 4, cam, inline }) {
   const [val, setVal] = useState("");
   useEffect(() => {
     if (val.length === length) {
@@ -13,14 +16,18 @@ export function Keypad({ title, subtitle, onSubmit, onCancel, error, length = 4,
   }, [val, length, onSubmit]);
   const press = (k) => {
     if (k === "del") setVal((v) => v.slice(0, -1));
-    else if (val.length < length) setVal((v) => v + k);
+    else if (val.length < length) {
+      if (val === "" && onStart) onStart();
+      setVal((v) => v + k);
+    }
   };
-  return (
-    <div className="overlay">
-      <div className="pinCard">
-        <button className="closeX" onClick={onCancel} aria-label="Cancel">
-          ✕
-        </button>
+  const card = (
+      <div className={`pinCard ${inline ? "inline" : ""}`}>
+        {onCancel && (
+          <button className="closeX" onClick={onCancel} aria-label="Cancel">
+            ✕
+          </button>
+        )}
         {cam && <CameraFeed cam={cam} size="sm" />}
         <h2 className="pinName">{title}</h2>
         <p className="pinSub">{subtitle}</p>
@@ -45,6 +52,6 @@ export function Keypad({ title, subtitle, onSubmit, onCancel, error, length = 4,
           </button>
         </div>
       </div>
-    </div>
   );
+  return inline ? card : <div className="overlay">{card}</div>;
 }

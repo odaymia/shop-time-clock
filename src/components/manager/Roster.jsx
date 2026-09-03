@@ -11,6 +11,7 @@ export function Roster({ employees, saveEmployees, flash, cfg }) {
     if (!/^\d{4}$/.test(draft.pin)) return flash("PIN must be 4 digits", "out");
     const clash = employees.find((e) => e.pin === draft.pin && e.id !== draft.id);
     if (clash) return flash(`${clash.name} already uses that PIN`, "out");
+    if (draft.pin === cfg?.managerPin) return flash("That's the manager PIN — pick another", "out");
     let next;
     if (draft.id) next = employees.map((e) => (e.id === draft.id ? draft : e));
     else next = [...employees, { ...draft, id: uid() }];

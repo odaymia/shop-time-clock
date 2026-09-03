@@ -2,6 +2,7 @@
 
 export const DEFAULT_CFG = {
   shopName: "Genie Auto Center",
+  kioskMode: "tiles", // "tiles" = tap your name then PIN; "pin" = PIN pad only, no names shown
   managerPin: "",
   weekStart: 1, // 0=Sun ... 6=Sat
   roundingMin: 0, // 0, 5, 6, 15

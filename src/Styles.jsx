@@ -153,6 +153,8 @@ input, select, textarea { font-family:inherit; font-size:17px; }
   border-radius:10px; border:1px solid var(--line); background:transparent;
   color:var(--muted); font-size:16px;
 }
+.pinStage { flex:1; display:flex; align-items:center; justify-content:center; padding:24px; }
+.pinCard.inline { max-width:460px; }
 .pinName { margin:0; font-size:26px; text-align:center; font-weight:600; }
 .pinSub { margin:6px 0 0; text-align:center; color:var(--muted); font-size:15px; }
 .dots { display:flex; gap:14px; justify-content:center; margin:22px 0 6px; }

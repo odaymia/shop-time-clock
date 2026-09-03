@@ -1,7 +1,7 @@
 import { useState } from "react";
 
 /* ---------- settings ---------- */
-export function Settings({ cfg, saveCfg, flash }) {
+export function Settings({ cfg, saveCfg, flash, employees = [] }) {
   const [d, setD] = useState(cfg);
   const [pin, setPin] = useState("");
   const set = (k, v) => setD({ ...d, [k]: v });
@@ -9,6 +9,8 @@ export function Settings({ cfg, saveCfg, flash }) {
     const next = { ...d };
     if (pin) {
       if (!/^\d{4}$/.test(pin)) return flash("Manager PIN must be 4 digits", "out");
+      const clash = employees.find((e) => e.pin === pin);
+      if (clash) return flash(`${clash.name} already uses that PIN — pick another`, "out");
       next.managerPin = pin;
     }
     await saveCfg(next);
@@ -23,6 +25,13 @@ export function Settings({ cfg, saveCfg, flash }) {
         <label className="fld">
           <span>Shop name</span>
           <input value={d.shopName} onChange={(e) => set("shopName", e.target.value)} />
+        </label>
+        <label className="fld">
+          <span>Home screen</span>
+          <select value={d.kioskMode || "tiles"} onChange={(e) => set("kioskMode", e.target.value)}>
+            <option value="tiles">Name tiles — tap your name, then enter your PIN</option>
+            <option value="pin">PIN pad only — no names shown until a PIN is entered</option>
+          </select>
         </label>
         <label className="fld">
           <span>Pay week starts</span>

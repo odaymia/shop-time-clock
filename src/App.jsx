@@ -376,6 +376,24 @@ export default function TimeClock() {
   const active = employees.filter((e) => e.active !== false);
   const nowDate = new Date(now);
 
+  /* PIN-only home screen: nobody's name is on the wall until they've
+     entered their PIN. The manager PIN on the same pad opens the office. */
+  const pinMode = cfg.kioskMode === "pin";
+  const submitKioskPin = (v) => {
+    if (v === cfg.managerPin) {
+      setPinErr("");
+      setScreen("manager");
+      return;
+    }
+    const emp = active.find((e) => e.pin === v);
+    if (!emp) {
+      setPinErr("That PIN doesn't match anyone. Try again.");
+      return;
+    }
+    setPinErr("");
+    setActionFor(emp);
+  };
+
   return (
     <div className="root">
       <Styles />
@@ -427,6 +445,18 @@ export default function TimeClock() {
             Add your team
           </button>
         </div>
+      ) : pinMode ? (
+        <main className="pinStage">
+          <Keypad
+            inline
+            title="Punch in or out"
+            subtitle="Enter your 4-digit PIN"
+            error={pinErr}
+            onSubmit={submitKioskPin}
+            onStart={cfg.photos ? () => cam.start() : undefined}
+            cam={cfg.photos ? cam : null}
+          />
+        </main>
       ) : (
         <main className="grid">
           {active.map((emp) => {
@@ -506,7 +536,9 @@ export default function TimeClock() {
         <button className="linkBtn" onClick={() => setManagerPin(true)}>
           Manager
         </button>
-        <span className="footNote">Tap your name to punch in or out</span>
+        <span className="footNote">
+          {pinMode ? "Enter your PIN to punch in or out" : "Tap your name to punch in or out"}
+        </span>
       </footer>
 
       {pinFor && (

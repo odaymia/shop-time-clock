@@ -61,7 +61,9 @@ export function Manager({
       {tab === "roster" && (
         <Roster employees={employees} saveEmployees={saveEmployees} flash={flash} cfg={cfg} />
       )}
-      {tab === "settings" && <Settings cfg={cfg} saveCfg={saveCfg} flash={flash} />}
+      {tab === "settings" && (
+        <Settings cfg={cfg} saveCfg={saveCfg} flash={flash} employees={employees} />
+      )}
     </div>
   );
 }
