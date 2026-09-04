@@ -332,6 +332,9 @@ export default function TimeClock() {
       const evs = Object.values(monthsRef.current)
         .flat()
         .filter((x) => x.empId === emp.id);
+      /* belt and braces: a cloud pull landing mid-punch must not hide the
+         very clock-out that triggered this review */
+      if (ev && !evs.some((x) => x.id === ev.id)) evs.push(ev);
       const summary = periodSummary(evs, cfg, target, Date.now());
       if (summary.totals.total === 0) return;
 
