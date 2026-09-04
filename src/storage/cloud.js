@@ -372,8 +372,9 @@ async function init(backend, apply) {
 }
 
 /* Join the shop this account belongs to, or create one from local
-   settings. Whatever this device has locally is queued for upload, so
-   the first device you link (the iPad) seeds the cloud copy. */
+   settings. The first device to link seeds the cloud copy. A later device
+   only uploads what the cloud doesn't have yet — its own stale copy of
+   settings or the roster must never overwrite the shop's real ones. */
 async function linkShop() {
   const { data: rows, error } = await supabase
     .from("shop_members")
@@ -383,9 +384,13 @@ async function linkShop() {
   if (error) throw error;
   let id;
   let name;
+  const cloudHas = new Set();
   if (rows && rows.length) {
     id = rows[0].shop_id;
     name = rows[0].shops?.name || "";
+    const { data: keys, error: e3 } = await supabase.from("kv").select("key").eq("shop_id", id);
+    if (e3) throw e3;
+    for (const k of keys || []) cloudHas.add(k.key);
   } else {
     const cfg = await lget("gac:config", null);
     name = (cfg && cfg.shopName) || "My shop";
@@ -396,16 +401,18 @@ async function linkShop() {
   await lset(SHOP_KEY, { id, name });
   await lset(SYNC_KEY, { kv: EPOCH, punches: EPOCH });
   setState({ shopId: id, shopName: name });
-  await uploadEverything();
+  await uploadEverything(cloudHas);
   start();
 }
-async function uploadEverything() {
+async function uploadEverything(skipKv) {
   const r = await local.list("gac:");
   for (const key of (r && r.keys) || []) {
     const value = await lget(key, null);
     if (value == null) continue;
     const kind = keyKind(key);
-    if (kind === "kv") await enqueue({ kind, op: "put", key, value }, true);
+    if (kind === "kv") {
+      if (!skipKv.has(key)) await enqueue({ kind, op: "put", key, value }, true);
+    }
     else if (kind === "punch")
       await enqueue({ kind, month: key.slice(PUNCH_PREFIX.length), upserts: value, deletes: [] }, true);
     else await enqueue({ kind, op: "put", key, value }, true);

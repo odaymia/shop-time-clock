@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { CloudSync } from "../CloudSync.jsx";
 
 /* ---------- settings ---------- */
 export function Settings({ cfg, saveCfg, flash, employees = [] }) {
   const [d, setD] = useState(cfg);
   const [pin, setPin] = useState("");
+  useEffect(() => setD(cfg), [cfg]);
   const set = (k, v) => setD({ ...d, [k]: v });
   const save = async () => {
     const next = { ...d };
