@@ -98,6 +98,17 @@ export default function TimeClock() {
   }, []);
 
   const cam = useCamera(cfg.photos);
+  const keepCam = cfg.photos && cfg.cameraKeepOn !== false;
+  /* A Home Screen web app on iPadOS re-asks for the camera every time it's
+     opened. Holding it open means one prompt per launch instead of one per
+     punch. The kiosk footer shows a live indicator while it's on. */
+  useEffect(() => {
+    if (keepCam && ready && screen !== "setup") cam.start();
+    if (!keepCam) cam.stop();
+  }, [keepCam, ready, screen]); // eslint-disable-line
+  const releaseCam = () => {
+    if (!keepCam) cam.stop();
+  };
 
   const flash = useCallback((text, tone) => {
     setToast({ text, tone });
@@ -216,7 +227,7 @@ export default function TimeClock() {
     setActionFor(null);
     setShowSchedule(null);
     setPinErr("");
-    cam.stop();
+    releaseCam();
   };
   const submitEmployeePin = (v) => {
     if (!pinFor) return;
@@ -236,7 +247,7 @@ export default function TimeClock() {
       return;
     }
     setActionFor(null);
-    cam.stop();
+    releaseCam();
     const ev = await addEvent(emp.id, type, null, shot);
     const t = fmtTime(new Date(ev.ts));
     const label = {
@@ -567,6 +578,11 @@ export default function TimeClock() {
           Manager
         </button>
         <span className="footNote">
+          {keepCam && cam.state === "live" && (
+            <span className="camLive" title="The camera is ready. A photo is taken only when someone punches.">
+              <span className="camLiveDot" /> Camera ready
+            </span>
+          )}
           {pinMode ? "Enter your PIN to punch in or out" : "Tap your name to punch in or out"}
         </span>
       </footer>
@@ -617,7 +633,7 @@ export default function TimeClock() {
           onSchedule={() => {
             setShowSchedule(actionFor);
             setActionFor(null);
-            cam.stop();
+            releaseCam();
           }}
         />
       )}

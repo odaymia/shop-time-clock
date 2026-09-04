@@ -11,6 +11,7 @@ export const DEFAULT_CFG = {
   otRules: "ca", // "ca" = daily >8 / >12, weekly >40 ; "flsa" = weekly >40 only
   photos: true, // take a photo with each punch
   photoRequired: false, // block the punch if the camera isn't working
+  cameraKeepOn: true, // hold the camera open between punches so iPadOS asks for permission once, not per punch
   photoRetentionDays: 45, // photos older than this are deleted automatically
   attestation: true, // sign off on hours at the end of the pay period
   breakRules: true, // California meal and rest period tracking

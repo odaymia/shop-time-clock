@@ -107,7 +107,9 @@ input, select, textarea { font-family:inherit; font-size:17px; }
   display:flex; align-items:center; justify-content:space-between;
   padding:14px 28px 20px; border-top:1px solid var(--line);
 }
-.footNote { color:#59636f; font-size:14px; }
+.footNote { color:#59636f; font-size:14px; display:flex; align-items:center; gap:18px; }
+.camLive { display:inline-flex; align-items:center; gap:7px; color:var(--live); }
+.camLiveDot { width:8px; height:8px; border-radius:50%; background:var(--live); box-shadow:0 0 0 3px rgba(63,181,106,.18); }
 .linkBtn {
   background:none; border:1px solid var(--line); color:var(--muted);
   padding:10px 18px; border-radius:9px; font-size:15px;

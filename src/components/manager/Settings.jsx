@@ -130,6 +130,16 @@ export function Settings({ cfg, saveCfg, flash, employees = [] }) {
               </select>
             </label>
             <label className="fld">
+              <span>Camera between punches</span>
+              <select
+                value={d.cameraKeepOn === false ? "punch" : "ready"}
+                onChange={(e) => set("cameraKeepOn", e.target.value === "ready")}
+              >
+                <option value="ready">Stay ready — iPad asks for permission once per launch</option>
+                <option value="punch">Open only during a punch — iPad asks every time</option>
+              </select>
+            </label>
+            <label className="fld">
               <span>Keep photos for</span>
               <select
                 value={d.photoRetentionDays}
@@ -225,9 +235,11 @@ export function Settings({ cfg, saveCfg, flash, employees = [] }) {
         you can turn rounding off and the real numbers come back.
       </p>
       <p className="legalNote">
-        Punch photos are small stills stored on this iPad only — nothing is uploaded anywhere. The
-        camera preview stays visible while someone punches so nobody is recorded without seeing it.
-        Photos delete themselves after the window you set above. California treats a face image as
+        Punch photos are small stills kept on this iPad and, when cloud sync is on, in your shop's
+        private cloud storage — never anywhere public. With the camera set to stay ready, it is
+        open but nothing is captured until someone punches, and the kiosk footer says so. The
+        preview stays visible while someone punches so nobody is recorded without seeing it. Photos
+        delete themselves after the window you set above. California treats a face image as
         biometric-adjacent personal information, so tell your crew in writing that the clock takes a
         photo and why, and keep that notice with your handbook.
       </p>
