@@ -3,12 +3,14 @@ import { schedKeyFor } from "../../lib/keys.js";
 import { SHIFT_PRESETS, fmtHHMM, shiftHours } from "../../lib/schedule.js";
 import { addDays, dayKey, pad2, startOfWeek } from "../../lib/time.js";
 import { sGet, sSet } from "../../storage/index.js";
+import { useStorageVersion } from "../../hooks/useCloud.js";
 
 /* ---------- schedule builder ---------- */
 export function ScheduleBuilder({ cfg, employees, flash, clip, setClip }) {
   const [offset, setOffset] = useState(0);
   const [sched, setSched] = useState(undefined);
   const [editing, setEditing] = useState(null);
+  const version = useStorageVersion();
   const weekStart = addDays(startOfWeek(new Date(), cfg.weekStart), offset * 7);
   const key = schedKeyFor(dayKey(weekStart));
   const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
@@ -20,7 +22,6 @@ export function ScheduleBuilder({ cfg, employees, flash, clip, setClip }) {
 
   useEffect(() => {
     let dead = false;
-    setSched(undefined);
     (async () => {
       const s = await sGet(key, null);
       if (!dead) setSched(s || { published: false, shifts: {} });
@@ -28,7 +29,7 @@ export function ScheduleBuilder({ cfg, employees, flash, clip, setClip }) {
     return () => {
       dead = true;
     };
-  }, [key]);
+  }, [key, version]);
 
   const persist = async (next) => {
     setSched(next);

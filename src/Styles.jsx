@@ -575,6 +575,10 @@ table.tc td.tot { font-weight:700; }
 .pinMask { letter-spacing:.1em; }
 
 .settingsGrid { max-width:520px; }
+.cloudTitle { margin-top:36px; }
+.cloudBox { display:flex; flex-direction:column; gap:10px; }
+.cloudBox p { margin:0; line-height:1.5; }
+.setupCloud { margin-top:18px; border-top:1px solid var(--line); padding-top:14px; }
 
 /* boot */
 .bootWrap { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; }

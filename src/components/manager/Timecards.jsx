@@ -11,6 +11,7 @@ import { uid } from "../../lib/ids.js";
 import { punchesFromShift, schedTs, shiftHours } from "../../lib/schedule.js";
 import { addDays, dayKey, decHours, fmtDateShort, fmtTime, startOfWeek, ym } from "../../lib/time.js";
 import { sGet } from "../../storage/index.js";
+import { useStorageVersion } from "../../hooks/useCloud.js";
 
 /* ---------- timecards ---------- */
 export function Timecards({ cfg, employees, months, loadMonth, updateEvents, now, flash }) {
@@ -24,6 +25,7 @@ export function Timecards({ cfg, employees, months, loadMonth, updateEvents, now
   const [view, setView] = useState("hours"); // hours | variance
   const [sched, setSched] = useState(null);
   const [varDetail, setVarDetail] = useState(null);
+  const version = useStorageVersion();
 
   const weekStartDate = addDays(startOfWeek(new Date(), cfg.weekStart), weekOffset * 7);
   const weekEndDate = addDays(weekStartDate, 6);
@@ -33,7 +35,7 @@ export function Timecards({ cfg, employees, months, loadMonth, updateEvents, now
   useEffect(() => {
     loadMonth(ym(weekStartDate));
     loadMonth(ym(weekEndDate));
-  }, [weekOffset]); // eslint-disable-line
+  }, [weekOffset, version]); // eslint-disable-line
 
   useEffect(() => {
     let dead = false;
@@ -44,7 +46,7 @@ export function Timecards({ cfg, employees, months, loadMonth, updateEvents, now
     return () => {
       dead = true;
     };
-  }, [weekOffset]); // eslint-disable-line
+  }, [weekOffset, version]); // eslint-disable-line
 
   useEffect(() => {
     let dead = false;
@@ -60,7 +62,7 @@ export function Timecards({ cfg, employees, months, loadMonth, updateEvents, now
     return () => {
       dead = true;
     };
-  }, [weekOffset, employees]); // eslint-disable-line
+  }, [weekOffset, employees, version]); // eslint-disable-line
 
   const all = Object.values(months).flat();
   const days = Array.from({ length: 7 }, (_, i) => addDays(weekStartDate, i));

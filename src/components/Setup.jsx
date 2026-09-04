@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { CloudSync } from "./CloudSync.jsx";
+import { useCloud } from "../hooks/useCloud.js";
 
 /* ---------- setup ---------- */
 export function Setup({ cfg, onDone }) {
@@ -6,6 +8,8 @@ export function Setup({ cfg, onDone }) {
   const [pin, setPin] = useState("");
   const [pin2, setPin2] = useState("");
   const [err, setErr] = useState("");
+  const [signin, setSignin] = useState(false);
+  const cloudState = useCloud();
   const go = () => {
     if (!name.trim()) return setErr("Give the shop a name.");
     if (!/^\d{4}$/.test(pin)) return setErr("The manager PIN needs to be 4 digits.");
@@ -48,6 +52,23 @@ export function Setup({ cfg, onDone }) {
         <p className="setupNote">
           The manager PIN opens timecards, the roster, and settings. Keep it off the shop floor.
         </p>
+        {cloudState.configured && (
+          <div className="setupCloud">
+            {signin ? (
+              <>
+                <p className="setupNote">
+                  Sign in with the account you used on the iPad. Settings, roster, and punches
+                  come across in a moment.
+                </p>
+                <CloudSync compact />
+              </>
+            ) : (
+              <button className="linkBtn wide" onClick={() => setSignin(true)}>
+                Already set up on another device? Sign in instead
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

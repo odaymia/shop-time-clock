@@ -3,6 +3,7 @@ import { schedKeyFor } from "../lib/keys.js";
 import { fmtHHMM, shiftHours } from "../lib/schedule.js";
 import { addDays, dayKey, startOfWeek } from "../lib/time.js";
 import { sGet } from "../storage/index.js";
+import { useStorageVersion } from "../hooks/useCloud.js";
 
 /* ---------- one person's schedule ---------- */
 /* Reached only after a correct PIN, and it never loads anyone else's
@@ -11,6 +12,7 @@ import { sGet } from "../storage/index.js";
 export function MySchedule({ emp, cfg, onClose }) {
   const [offset, setOffset] = useState(0);
   const [sched, setSched] = useState(undefined);
+  const version = useStorageVersion();
   const weekStart = addDays(startOfWeek(new Date(), cfg.weekStart), offset * 7);
   const todayKey = dayKey(new Date());
 
@@ -24,7 +26,7 @@ export function MySchedule({ emp, cfg, onClose }) {
     return () => {
       dead = true;
     };
-  }, [offset]); // eslint-disable-line
+  }, [offset, version]); // eslint-disable-line
 
   const mine = sched?.published ? sched.shifts?.[emp.id] || {} : null;
   const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));

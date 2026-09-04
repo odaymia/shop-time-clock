@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { CloudSync } from "../CloudSync.jsx";
 
 /* ---------- settings ---------- */
 export function Settings({ cfg, saveCfg, flash, employees = [] }) {
@@ -213,6 +214,11 @@ export function Settings({ cfg, saveCfg, flash, employees = [] }) {
       <button className="btn primary lg" onClick={save}>
         Save settings
       </button>
+
+      <h2 className="paneTitle cloudTitle">Cloud sync</h2>
+      <div className="settingsGrid">
+        <CloudSync />
+      </div>
       <p className="legalNote">
         Rounding applies to how hours are totaled. The exact punch time is always kept underneath, so
         you can turn rounding off and the real numbers come back.

@@ -15,7 +15,7 @@ import { uid } from "./lib/ids.js";
 import { CFG_KEY, EMP_KEY, attestKeyFor, photoKeyFor, punchKey, signKeyFor } from "./lib/keys.js";
 import { MEAL_START, breakCompliance, buildSessions, isLastDayOfPeriod, nextBreakDue, periodEnd, periodSummary, sessionWorkedMs } from "./lib/payroll.js";
 import { addDays, dayKey, fmtDateLong, fmtTime, hoursText, startOfWeek, ym } from "./lib/time.js";
-import { purgePhotos, sGet, sSet } from "./storage/index.js";
+import { cloud, purgePhotos, sGet, sSet, storageReady } from "./storage/index.js";
 
 /* ---------- main ---------- */
 export default function TimeClock() {
@@ -39,6 +39,7 @@ export default function TimeClock() {
   /* load */
   useEffect(() => {
     (async () => {
+      await storageReady();
       const c = await sGet(CFG_KEY, null);
       const e = await sGet(EMP_KEY, []);
       const thisM = ym(new Date());
@@ -60,6 +61,35 @@ export default function TimeClock() {
       purgePhotos(merged.photoRetentionDays);
     })();
   }, []);
+
+  /* another device changed something: re-read what we hold in state */
+  useEffect(
+    () =>
+      cloud.subscribe(async (e) => {
+        if (e.type !== "data") return;
+        const keys = e.keys || [];
+        if (keys.includes(CFG_KEY)) {
+          const c = await sGet(CFG_KEY, null);
+          if (c) {
+            const merged = { ...DEFAULT_CFG, ...c };
+            setCfg(merged);
+            setScreen((s) => (s === "setup" && merged.managerPin ? "kiosk" : s));
+          }
+        }
+        if (keys.includes(EMP_KEY)) setEmployees(await sGet(EMP_KEY, []));
+        const months = keys
+          .filter((k) => k.startsWith("gac:punches:"))
+          .map((k) => k.slice("gac:punches:".length))
+          .filter((m) => monthsRef.current[m]);
+        if (months.length) {
+          const next = { ...monthsRef.current };
+          for (const m of months) next[m] = await sGet(punchKey(m), []);
+          monthsRef.current = next;
+          setMonths(next);
+        }
+      }),
+    []
+  );
 
   /* tick */
   useEffect(() => {

@@ -24,6 +24,9 @@ src/lib/config.js          DEFAULT_CFG
 src/lib/keys.js            storage key layout
 src/storage/index.js       the storage module (sGet/sSet/sDel/sList, purgePhotos)
 src/storage/indexeddb.js   IndexedDB backend with the window.storage shape
+src/storage/cloud.js       Supabase sync: outbox, pull, realtime, sign-in, shop link
+src/lib/cloudConfig.js     Supabase URL + publishable key, read from .env at build
+supabase/schema.sql        tables, row-level security, storage bucket — run once
 src/hooks/useCamera.js     front-camera capture
 src/components/            employee-facing screens and shared UI
 src/components/manager/    timecards, schedule builder, roster, settings
@@ -61,16 +64,28 @@ URL in Safari and add it to the Home Screen.
 
 ## Storage
 
-All data is local to the device. There is no server.
+Every device keeps a full local copy (IndexedDB) and reads only from it, so
+the clock works with no signal. When the device is signed in to a shop,
+writes are also queued and mirrored to Supabase, and changes from other
+devices are pulled in (realtime subscription plus a 60s poll). The manager
+signs in with email + password; the shop iPad is signed in once and stays
+that way. Sync details live in `src/storage/cloud.js`; the schema and
+row-level-security policies are in `supabase/schema.sql`.
 
 The app calls a small async key-value API: `get(key)`, `set(key, value)`,
 `delete(key)`, `list(prefix)`. Inside a Claude artifact this is provided by
 `window.storage`. In the standalone build it is shimmed over IndexedDB in
 `src/storage/indexeddb.js`.
 
-**Keep that abstraction.** Do not scatter IndexedDB or localStorage calls through
-the app. There is one storage module; everything goes through it. When this moves
-to a server, only that module changes.
+**Keep that abstraction.** Do not scatter IndexedDB, localStorage, or Supabase
+calls through the app. There is one storage module; everything goes through it.
+Cloud routing by key: `gac:punches:*` is one row per event in the `punches`
+table with tombstones (so devices converge on the same log); `gac:photo:*` and
+`gac:signature:*` go to the `media` storage bucket and are fetched on demand;
+everything else is a row in `kv`, last write wins.
+
+Sign-in order matters: the first device to link a shop uploads what it has,
+so link the iPad (which holds the data) before the manager's computer.
 
 Do not use localStorage for punch photos. A year of photos exceeds its quota.
 
@@ -143,8 +158,11 @@ and "rest period." No jargon on the employee-facing screens.
 
 ## Known gaps
 
-- Data lives on one iPad with no sync or backup. Weekly CSV export is the only
-  safety net. This is the most important thing to fix.
+- Cloud sync is new and lightly tested. Photos upload one object each; a big
+  backlog after first sign-in can take a while. Sign-out is blocked while
+  changes are pending so nothing is lost.
+- The iPad is signed in as the manager's account. A kiosk-only role (can punch,
+  can't read timecards) would be the right next step for the SaaS version.
 - No 7th-consecutive-day overtime.
 - No automated tests. `src/lib/payroll.js` is pure and easy to test; start
   there.
