@@ -8,7 +8,7 @@ import { VarianceModal } from "./VarianceModal.jsx";
 import { attestKeyFor, schedKeyFor } from "../../lib/keys.js";
 import { breakCompliance, buildSessions, mealIsPaid, sessionBreakMs, sessionMealMs, sessionPaidMealMs, sessionWorkedMs, splitDay, weekTotals } from "../../lib/payroll.js";
 import { uid } from "../../lib/ids.js";
-import { punchesFromShift, schedTs, shiftHours } from "../../lib/schedule.js";
+import { fmtHHMM, punchesFromShift, schedTs, shiftHours } from "../../lib/schedule.js";
 import { addDays, dayKey, decHours, fmtDateShort, fmtTime, startOfWeek, ym } from "../../lib/time.js";
 import { sGet } from "../../storage/index.js";
 import { useStorageVersion } from "../../hooks/useCloud.js";
@@ -25,6 +25,7 @@ export function Timecards({ cfg, employees, months, loadMonth, updateEvents, now
   const [view, setView] = useState("hours"); // hours | variance
   const [sched, setSched] = useState(null);
   const [varDetail, setVarDetail] = useState(null);
+  const [fillAsk, setFillAsk] = useState(null); // { emp, days } awaiting confirm
   const version = useStorageVersion();
 
   const weekStartDate = addDays(startOfWeek(new Date(), cfg.weekStart), weekOffset * 7);
@@ -254,28 +255,47 @@ export function Timecards({ cfg, employees, months, loadMonth, updateEvents, now
   /* A manager filling in a day someone was scheduled but never clocked.
      Every punch is tagged "from schedule" — these are the manager's word,
      not the employee's, and the punch list says so. */
-  const fillFromSchedule = async (emp, v) => {
-    const list = punchesFromShift(v.shift, v.date, cfg);
-    if (!list.length) return flash("That shift has no usable times", "out");
+  const fillDays = async (emp, list) => {
     const filledAt = Date.now();
     const byMonth = {};
-    for (const p of list) {
-      const ev = {
-        id: uid(),
-        empId: emp.id,
-        type: p.type,
-        ts: p.ts,
-        filled: true,
-        payload: { source: "schedule", filledAt },
-      };
-      (byMonth[ym(new Date(p.ts))] ||= []).push(ev);
+    let n = 0;
+    for (const v of list) {
+      const punches = punchesFromShift(v.shift, v.date, cfg);
+      if (!punches.length) continue;
+      n++;
+      for (const p of punches) {
+        const ev = {
+          id: uid(),
+          empId: emp.id,
+          type: p.type,
+          ts: p.ts,
+          filled: true,
+          payload: { source: "schedule", filledAt },
+        };
+        (byMonth[ym(new Date(p.ts))] ||= []).push(ev);
+      }
     }
+    if (!n) return flash("Nothing to fill — those shifts have no usable times", "out");
     for (const [key, evs] of Object.entries(byMonth)) {
       await updateEvents(key, [...(months[key] || []), ...evs]);
     }
     setVarDetail(null);
-    flash(`${emp.name} clocked in from the schedule for ${fmtDateShort(v.date)}`);
+    setFillAsk(null);
+    flash(
+      n === 1
+        ? `${emp.name} clocked in from the schedule for ${fmtDateShort(list[0].date)}`
+        : `${emp.name}: ${n} days filled from the schedule`
+    );
   };
+  const fillFromSchedule = (emp, v) => fillDays(emp, [v]);
+
+  /* days this week the person was scheduled, never clocked, and the shift is over */
+  const shiftEnded = (v) => {
+    const s = schedTs(v.date, v.shift?.start);
+    const e = schedTs(v.date, v.shift?.end, s);
+    return e != null && e <= now;
+  };
+  const fillableDays = (r) => r.variance.filter((v) => v.kind === "noshow" && shiftEnded(v));
 
   const togglePaidMeal = async (ev) => {
     const key = ym(new Date(ev.ts));
@@ -488,12 +508,26 @@ export function Timecards({ cfg, employees, months, loadMonth, updateEvents, now
                     })()}
                   </td>
                   <td>
-                    <button
-                      className="btn tiny"
-                      onClick={() => setOpenEmp(openEmp === r.emp.id ? null : r.emp.id)}
-                    >
-                      {openEmp === r.emp.id ? "Hide" : "Punches"}
-                    </button>
+                    <span className="rowActs">
+                      {(() => {
+                        const f = fillableDays(r);
+                        return f.length > 0 ? (
+                          <button
+                            className="btn tiny primary"
+                            title="Scheduled but never clocked in — write the scheduled shift, lunch, and rest breaks as punches"
+                            onClick={() => setFillAsk({ emp: r.emp, days: f })}
+                          >
+                            Fill {f.length === 1 ? "day" : `${f.length} days`}
+                          </button>
+                        ) : null;
+                      })()}
+                      <button
+                        className="btn tiny"
+                        onClick={() => setOpenEmp(openEmp === r.emp.id ? null : r.emp.id)}
+                      >
+                        {openEmp === r.emp.id ? "Hide" : "Punches"}
+                      </button>
+                    </span>
                   </td>
                 </tr>
               ))}
@@ -549,6 +583,44 @@ export function Timecards({ cfg, employees, months, loadMonth, updateEvents, now
           onClose={() => setEditing(null)}
           flash={flash}
         />
+      )}
+
+      {fillAsk && (
+        <div className="overlay">
+          <div className="editCard">
+            <button className="closeX" onClick={() => setFillAsk(null)} aria-label="Close">
+              ✕
+            </button>
+            <h2 className="editTitle">Fill from the schedule — {fillAsk.emp.name}</h2>
+            <p className="muted">
+              These days were scheduled but never clocked. Each one gets the scheduled clock-in and
+              clock-out, the scheduled lunch, and rest breaks by the California bands. Every punch
+              is tagged “from schedule” so it never passes for a real one.
+            </p>
+            <ul className="fillList">
+              {fillAsk.days.map((v) => (
+                <li key={v.day}>
+                  <strong>{fmtDateShort(v.date)}</strong>
+                  <span>
+                    {fmtHHMM(v.shift.start)} – {fmtHHMM(v.shift.end)}
+                    {v.shift.lunch ? ` · ${v.shift.lunch} min lunch` : " · no lunch"} ·{" "}
+                    {v.schedH.toFixed(2)} hrs
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <button
+              className="btn primary lg full"
+              onClick={() => fillDays(fillAsk.emp, fillAsk.days)}
+            >
+              Fill {fillAsk.days.length === 1 ? "this day" : `these ${fillAsk.days.length} days`}
+            </button>
+            <p className="setupNote">
+              Only do this for days they actually worked. If they worked through lunch, enter the
+              real punches instead so the premium gets flagged.
+            </p>
+          </div>
+        </div>
       )}
 
       {varDetail && (

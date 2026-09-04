@@ -534,6 +534,10 @@ table.tc td.ot { color:var(--signal); }
 table.tc td.tot { font-weight:700; }
 .stick { text-align:left !important; position:sticky; left:0; background:var(--panel); z-index:2; }
 .nameCell { font-weight:600; }
+.rowActs { display:inline-flex; gap:6px; }
+.fillList { list-style:none; margin:0 0 18px; padding:0; display:flex; flex-direction:column; gap:8px; }
+.fillList li { display:flex; justify-content:space-between; gap:14px; padding:10px 12px; background:var(--asphalt); border:1px solid var(--line); border-radius:9px; font-size:14px; }
+.fillList li span { color:var(--muted); }
 .warnDot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--warn); margin-left:8px; vertical-align:middle; }
 
 .punches { margin-top:22px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; }
