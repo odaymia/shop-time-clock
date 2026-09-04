@@ -12,7 +12,7 @@ import { Manager } from "./components/manager/Manager.jsx";
 import { useCamera } from "./hooks/useCamera.js";
 import { DEFAULT_CFG } from "./lib/config.js";
 import { uid } from "./lib/ids.js";
-import { CFG_KEY, EMP_KEY, attestKeyFor, photoKeyFor, punchKey, signKeyFor } from "./lib/keys.js";
+import { CFG_KEY, EMP_KEY, attestKeyFor, photoKeyFor, punchKey, schedKeyFor, signKeyFor } from "./lib/keys.js";
 import { MEAL_START, breakCompliance, buildSessions, isLastDayOfPeriod, nextBreakDue, periodEnd, periodSummary, sessionWorkedMs } from "./lib/payroll.js";
 import { addDays, dayKey, fmtDateLong, fmtTime, hoursText, startOfWeek, ym } from "./lib/time.js";
 import { cloud, purgePhotos, sGet, sSet, storageReady } from "./storage/index.js";
@@ -310,11 +310,14 @@ export default function TimeClock() {
   const maybeReview = useCallback(
     async (emp, type, ev) => {
       const when = new Date(ev.ts);
+      const thisWeek = startOfWeek(when, cfg.weekStart);
       let target = null;
 
-      if (type === "out" && isLastDayOfPeriod(cfg, when)) {
-        target = startOfWeek(when, cfg.weekStart);
-      } else {
+      if (type === "out") {
+        if (isLastDayOfPeriod(cfg, when)) target = thisWeek;
+        else if (await isLastScheduledDay(emp, when, thisWeek)) target = thisWeek;
+      }
+      if (!target) {
         const prior = startOfWeek(addDays(when, -7), cfg.weekStart);
         const priorEnd = addDays(prior, 7).getTime();
         if (when.getTime() >= priorEnd) target = prior;
@@ -323,7 +326,6 @@ export default function TimeClock() {
 
       const key = attestKeyFor(dayKey(target), emp.id);
       const already = await sGet(key, null);
-      if (already) return;
 
       // read from the ref, not state — the clock-out that triggered this
       // review was written milliseconds ago and must be included
@@ -333,10 +335,27 @@ export default function TimeClock() {
       const summary = periodSummary(evs, cfg, target, Date.now());
       if (summary.totals.total === 0) return;
 
-      setReview({ emp, periodStartDate: target, summary, key });
+      /* Already signed: only come back if the hours moved since — a shift
+         picked up after signing, or a manager fixing a punch. */
+      if (already && Math.abs((already.totals?.total || 0) - summary.totals.total) < 0.01) return;
+
+      setReview({ emp, periodStartDate: target, summary, key, resign: !!already });
     },
     [cfg]
   );
+
+  /* Their last scheduled day of the week, per the posted schedule. Someone
+     who works Mon–Fri signs on Friday's clock-out, not Sunday's or the
+     next Monday's. Needs a posted week with at least one shift for them. */
+  const isLastScheduledDay = async (emp, when, weekStart) => {
+    const sched = await sGet(schedKeyFor(dayKey(weekStart)), null);
+    if (!sched?.published) return false;
+    const mine = sched.shifts?.[emp.id] || {};
+    const days = Object.keys(mine).filter((k) => mine[k]);
+    if (!days.length) return false;
+    const today = dayKey(when);
+    return !days.some((k) => k > today);
+  };
 
   const submitReview = async ({ agreed, signature, note }) => {
     if (!review) return;
@@ -666,6 +685,7 @@ export default function TimeClock() {
           cfg={cfg}
           summary={review.summary}
           periodStartDate={review.periodStartDate}
+          resign={review.resign}
           onSubmit={submitReview}
           onDefer={() => setReview(null)}
         />

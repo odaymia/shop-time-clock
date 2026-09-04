@@ -4,7 +4,7 @@ import { periodEnd } from "../lib/payroll.js";
 import { dayKey, fmtDateShort, fmtTime } from "../lib/time.js";
 
 /* ---------- end-of-period review ---------- */
-export function ReviewSheet({ emp, cfg, summary, periodStartDate, onSubmit, onDefer }) {
+export function ReviewSheet({ emp, cfg, summary, periodStartDate, resign, onSubmit, onDefer }) {
   const [mode, setMode] = useState("review"); // review | sign | dispute
   const [inked, setInked] = useState(false);
   const [note, setNote] = useState("");
@@ -23,10 +23,13 @@ export function ReviewSheet({ emp, cfg, summary, periodStartDate, onSubmit, onDe
       <div className="reviewCard">
         <header className="reviewHead">
           <div>
-            <h2 className="reviewTitle">Check your hours, {emp.name.split(" ")[0]}</h2>
+            <h2 className="reviewTitle">
+              {resign ? "Your hours changed" : "Check your hours"}, {emp.name.split(" ")[0]}
+            </h2>
             <p className="reviewSub">
               Pay period {periodStartDate.toLocaleDateString(undefined, { month: "short", day: "numeric" })} –{" "}
               {pEnd.toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+              {resign ? " · they moved since you signed, so please check and sign again" : ""}
             </p>
           </div>
           <div className="reviewTotal">
