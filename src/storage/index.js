@@ -27,8 +27,12 @@ export function storageReady() {
 }
 
 async function readLocal(key, fallback) {
-  const r = await storage.get(key);
-  return r && r.value != null ? JSON.parse(r.value) : fallback;
+  try {
+    const r = await storage.get(key);
+    return r && r.value != null ? JSON.parse(r.value) : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export async function sGet(key, fallback) {

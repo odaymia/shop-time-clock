@@ -30,7 +30,9 @@ export function createIndexedDbStorage() {
         new Promise((res, rej) => {
           const t = db.transaction(STORE, mode);
           const out = fn(t.objectStore(STORE));
-          t.oncomplete = () => res(out && out.result !== undefined ? out.result : out);
+          /* a request for a missing key has result === undefined; resolve
+             to that, never to the request object itself */
+          t.oncomplete = () => res(out instanceof IDBRequest ? out.result : out);
           t.onerror = () => rej(t.error);
           t.onabort = () => rej(t.error);
         })
