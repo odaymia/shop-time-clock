@@ -44,7 +44,7 @@ export function ActionSheet({ emp, status, worked, onPunch, onCancel, cam, due, 
             <strong>{mealShort ? mmss(mealLeft) : "30:00+"}</strong>
             <span>
               {mealShort
-                ? "left before your lunch counts as a full 30"
+                ? "left of your 30-minute lunch"
                 : cfg?.mealPay === "always"
                 ? "you've had a full lunch — head back whenever you're ready"
                 : "you've had a full lunch — clock back in when ready"}
@@ -106,14 +106,23 @@ export function ActionSheet({ emp, status, worked, onPunch, onCancel, cam, due, 
           {onMeal && confirmShort && (
             <div className="shortWarn">
               <p>
-                That's only {Math.floor(mealElapsed / 60000)} minutes. California requires a full 30,
-                and coming back early can cost the shop an hour of premium pay.
+                You've had {Math.floor(mealElapsed / 60000)} minutes. The full 30 is yours — nobody
+                needs you back yet. If you go back now, it's recorded as your choice to end lunch
+                early.
               </p>
               <button className="bigAct in" onClick={() => setConfirmShort(false)}>
                 Finish my lunch
               </button>
-              <button className="bigAct out" onClick={() => onPunch("mealEnd")}>
-                Go back to work anyway
+              <button
+                className="bigAct out"
+                onClick={() =>
+                  onPunch("mealEnd", {
+                    earlyReturn: "chose",
+                    lunchMinutes: Math.floor(mealElapsed / 60000),
+                  })
+                }
+              >
+                Go back to work now — my choice
               </button>
             </div>
           )}

@@ -239,7 +239,7 @@ export default function TimeClock() {
     setActionFor(pinFor);
     setPinFor(null);
   };
-  const doPunch = async (type) => {
+  const doPunch = async (type, payload) => {
     const emp = actionFor;
     const shot = cfg.photos ? cam.capture() : null;
     if (cfg.photos && cfg.photoRequired && !shot) {
@@ -248,7 +248,7 @@ export default function TimeClock() {
     }
     setActionFor(null);
     releaseCam();
-    const ev = await addEvent(emp.id, type, null, shot);
+    const ev = await addEvent(emp.id, type, null, shot, payload);
     const t = fmtTime(new Date(ev.ts));
     const label = {
       in: `${emp.name} clocked in at ${t}`,
