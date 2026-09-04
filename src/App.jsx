@@ -651,7 +651,12 @@ export default function TimeClock() {
           emp={breakAsk.emp}
           comp={breakAsk.comp}
           onSubmit={submitBreakAttest}
-          onSkip={() => setBreakAsk(null)}
+          onSkip={() => {
+            /* skipping the break question must not skip the period sign-off */
+            const { emp, ev } = breakAsk;
+            setBreakAsk(null);
+            if (cfg.attestation) maybeReview(emp, "out", ev);
+          }}
         />
       )}
 
